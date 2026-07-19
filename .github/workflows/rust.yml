@@ -41,7 +41,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     if: true # Temporarily set to true for testing in PR
     needs: ci
+    env:
+      RUSTFLAGS: "" # Clear global -D warnings to allow release build test
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -64,7 +67,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
-          targets: ${{ matrix.target }}
+          target: ${{ matrix.target }}
 
       - name: Build Release
         run: cargo build --release --target ${{ matrix.target }} ${{ matrix.args }}
