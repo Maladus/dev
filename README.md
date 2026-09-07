@@ -272,6 +272,9 @@ previously every `runArg` was parsed and then dropped.)
 | `--cap-add` | `--cap-add VALUE`, `--cap-add=VALUE` | HostConfig `CapAdd` entries |
 | `--security-opt` | `--security-opt VALUE`, `--security-opt=VALUE` | HostConfig `SecurityOpt` entries |
 | `--userns` | `--userns VALUE`, `--userns=VALUE` | HostConfig `UsernsMode`; last value wins |
+| `--device` | `--device VALUE`, `--device=VALUE` | HostConfig `Devices` entries |
+| `--group-add` | `--group-add VALUE`, `--group-add=VALUE` | HostConfig `GroupAdd` entries |
+| `--name` | `--name VALUE`, `--name=VALUE` | overrides the derived container name |
 | `--privileged` | `--privileged` only | HostConfig `Privileged=true` |
 | `--init` | `--init` only | HostConfig `Init=true` |
 
@@ -284,8 +287,8 @@ another flag.
 
 Apple Containers supports only the environment subset (`--env-file`, `--env`,
 and `-e`). Runtime options such as `--cap-add`, `--security-opt`, `--userns`,
-`--privileged`, and `--init` fail before side effects when `--runtime apple` or
-`defaultRuntime: "apple"` selects Apple.
+`--device`, `--group-add`, `--privileged`, and `--init` fail before side
+effects when `--runtime apple` or `defaultRuntime: "apple"` selects Apple.
 
 ### The reporter's configuration
 

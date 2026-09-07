@@ -419,6 +419,8 @@ pub(crate) async fn run_with_runtime(
 
     // Build container config
     let name = container_name(workspace);
+    // `--name` in runArgs overrides the derived container name.
+    let name = resolved_run_args.name.clone().unwrap_or(name);
 
     let mut labels = HashMap::new();
     for (k, v) in &labels_list {
@@ -522,6 +524,8 @@ pub(crate) async fn run_with_runtime(
         cap_add: caps.cap_add,
         security_opt: caps.security_opt,
         userns_mode: resolved_run_args.userns_mode.clone(),
+        devices: resolved_run_args.devices.clone(),
+        group_add: resolved_run_args.group_add.clone(),
     };
 
     if !container_config.mounts.is_empty() {
@@ -629,6 +633,12 @@ fn reject_run_args_unsupported_by_runtime(
     }
     if resolved.init {
         unsupported.push("--init");
+    }
+    if !resolved.devices.is_empty() {
+        unsupported.push("--device");
+    }
+    if !resolved.group_add.is_empty() {
+        unsupported.push("--group-add");
     }
 
     if !unsupported.is_empty() {
