@@ -1140,6 +1140,19 @@ async fn run_initialize_command(
     Ok(())
 }
 
+/// Expand a leading `~/` in a path to the remote user's home directory.
+fn expand_tilde(path: &str, user: Option<&str>) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = match user {
+            Some("root") | None => "/root".to_string(),
+            Some(u) => format!("/home/{u}"),
+        };
+        format!("{home}/{rest}")
+    } else {
+        path.to_string()
+    }
+}
+
 /// Clone and install dotfiles in the container (Gap 15).
 async fn install_dotfiles(
     runtime: &dyn ContainerRuntime,
@@ -1148,6 +1161,10 @@ async fn install_dotfiles(
     user: Option<&str>,
 ) -> anyhow::Result<()> {
     let target = dotfiles.target_path.as_deref().unwrap_or("~/dotfiles");
+    // Expand a leading `~/` to the remote user's home so the clone lands in the
+    // real home dir rather than a literal `~/dotfiles` directory (the shell
+    // would not expand `~` inside the single-quoted clone target).
+    let target = expand_tilde(target, user);
 
     eprintln!("Cloning dotfiles from {}...", dotfiles.repository);
 
@@ -2758,6 +2775,25 @@ mod tests {
             local_folder,
             &abs_workspace.to_string_lossy().to_string(),
             "local_folder label must be the absolute workspace path"
+        );
+    }
+
+    /// `~/` in the dotfiles target must expand to the remote user's home so the
+    /// clone lands in the real home dir, not a literal `~/dotfiles` directory.
+    #[test]
+    fn expand_tilde_resolves_to_the_remote_users_home() {
+        assert_eq!(
+            super::expand_tilde("~/dotfiles", Some("root")),
+            "/root/dotfiles"
+        );
+        assert_eq!(super::expand_tilde("~/dotfiles", None), "/root/dotfiles");
+        assert_eq!(
+            super::expand_tilde("~/dotfiles", Some("vscode")),
+            "/home/vscode/dotfiles"
+        );
+        assert_eq!(
+            super::expand_tilde("/abs/path", Some("vscode")),
+            "/abs/path"
         );
     }
 
