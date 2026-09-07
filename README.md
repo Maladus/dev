@@ -72,11 +72,14 @@ dev up                  # build if needed and start
 dev up --rebuild        # rebuild the image even if it exists
 dev up --no-cache       # rebuild without cache
 dev up --no-base        # skip ~/.dev/base for this run
+dev up --reuse          # reuse the existing container even if the config changed
 dev up --ports 3000     # override forwardPorts (host:container or just port)
 dev up --buildkit       # BuildKit-optimized feature installation
 ```
 
 `--frozen-lockfile` errors if `devcontainer-lock.json` is missing or its features don't match, for reproducible builds.
+
+When the effective config has changed since the container was built, `dev up` detects the drift: in an interactive terminal it asks whether to rebuild, and in a non-interactive context (CI, an agent) it prints a warning and reuses the existing container rather than blocking. `--rebuild` forces the rebuild without asking; `--reuse` skips the prompt and reuses. Rebuilding discards the container's writable layer (anything not in a volume), so the prompt lets you decide before that happens.
 
 `--update-remote-user-uid-default` (`on` by default, also accepted by `dev build`) sets the fallback for `updateRemoteUserUID` when the config doesn't declare it: on Linux, `on` rebuilds the image with the `remoteUser`'s UID/GID remapped to yours so bind-mounted files stay writable. `never` disables the remap even when the config asks for it. It is a no-op on macOS, and when `remoteUser` is `root` or a numeric UID.
 
@@ -476,6 +479,10 @@ dev config add   <property> <value>     # features, forwardPorts, remoteEnv, mou
 dev config unset <property>
 dev config remove <property> <value>
 dev config list
+
+dev config list --show-origin   # annotate each value with base/project, like `git config --list --show-origin`
+
+`dev config list` shows the effective (base + project) merged config by default, like `git config --list`; `--show-origin` annotates each value with the layer it came from.
 
 dev global new  [--name <n>] [--template <id>]
 dev global list
