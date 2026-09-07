@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crate::devcontainer::compose::{compose_recipe_config, materialize_recipe_directory};
@@ -36,6 +37,7 @@ pub async fn run(
     update_remote_user_uid_default: &str,
     port_overrides: &[String],
     no_base: bool,
+    reuse: bool,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
     run_with_runtime(
@@ -48,6 +50,7 @@ pub async fn run(
         update_remote_user_uid_default,
         port_overrides,
         no_base,
+        reuse,
     )
     .await
 }
@@ -70,6 +73,7 @@ pub(crate) async fn run_with_runtime(
     update_remote_user_uid_default: &str,
     port_overrides: &[String],
     no_base: bool,
+    reuse: bool,
 ) -> anyhow::Result<()> {
     let (config_path, recipe_config, project_declared_run_args) =
         match find_config_source(workspace)? {
@@ -165,9 +169,25 @@ pub(crate) async fn run_with_runtime(
     // Port bindings are fixed at container creation time, so when --ports
     // is supplied we must recreate the container to apply the new mappings.
     let has_port_overrides = !port_overrides.is_empty();
+    // Detect config drift: the effective config hash differs from the
+    // fingerprint stored on the existing container at create time. A container
+    // with no fingerprint (created before this feature) is treated as
+    // unchanged so we never nag on pre-existing containers.
+    let drift = existing
+        .first()
+        .and_then(|c| c.labels.get(CONFIG_HASH_LABEL))
+        .map(|stored| stored != &effective.config_hash)
+        .unwrap_or(false);
+    // When the config has drifted, ask the user (TTY) or warn (non-TTY) whether
+    // to rebuild. `--rebuild`/`--reuse` bypass the prompt entirely.
+    let rebuild_requested = if drift && !rebuild && !has_port_overrides && !reuse {
+        prompt_rebuild()
+    } else {
+        false
+    };
     if let Some(container) = existing.first() {
         match container.state {
-            ContainerState::Running if !rebuild && !has_port_overrides => {
+            ContainerState::Running if !rebuild && !has_port_overrides && !rebuild_requested => {
                 // Gated like every other exit that claims readiness. "Already
                 // running" is a readiness claim, and the container this arm
                 // reuses may be exactly the one a previous `dev up` refused:
@@ -190,7 +210,7 @@ pub(crate) async fn run_with_runtime(
                 println!("Container '{}' is already running.", container.name);
                 return Ok(());
             }
-            ContainerState::Stopped if !rebuild && !has_port_overrides => {
+            ContainerState::Stopped if !rebuild && !has_port_overrides && !rebuild_requested => {
                 println!("Starting existing container '{}'...", container.name);
                 runtime.start_container(&container.id).await?;
                 // Resolved before the gate, not just for the hooks: the probe
@@ -231,6 +251,12 @@ pub(crate) async fn run_with_runtime(
                 }
                 if rebuild {
                     eprintln!("Removing existing container '{}'...", container.name);
+                }
+                if rebuild_requested {
+                    eprintln!(
+                        "Rebuilding container '{}' to apply config changes...",
+                        container.name
+                    );
                 }
                 if container.state == ContainerState::Running {
                     runtime.stop_container(&container.id).await?;
@@ -398,6 +424,9 @@ pub(crate) async fn run_with_runtime(
     for (k, v) in &labels_list {
         labels.insert(k.clone(), v.clone());
     }
+    // Persist the effective config fingerprint so a later `dev up` can detect
+    // config drift and prompt/warn about a needed rebuild.
+    labels.insert(CONFIG_HASH_LABEL.to_string(), effective.config_hash.clone());
 
     // Substitute devcontainer variables in env values
     let mut env = HashMap::new();
@@ -640,6 +669,42 @@ const READINESS_MAX_POLL: std::time::Duration = std::time::Duration::from_secs(1
 /// The least budget an attempt is worth starting with, so a bounded one is
 /// never handed a window too short to reach the runtime at all.
 const READINESS_MIN_ATTEMPT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Container label carrying the effective config fingerprint, so a later
+/// `dev up` can detect config drift and prompt/warn about a needed rebuild.
+const CONFIG_HASH_LABEL: &str = "devcontainer.config_hash";
+
+/// Decide whether to rebuild an existing container whose config has drifted.
+/// Returns `true` to rebuild. In a non-interactive context (no TTY) it never
+/// rebuilds and instead prints a warning, so agents/CI are never blocked.
+fn prompt_rebuild() -> bool {
+    if !is_interactive() {
+        eprintln!("Warning: the dev container config has changed since this container was built.");
+        eprintln!("Run 'dev up --rebuild' to apply the changes.");
+        return false;
+    }
+    // Test hook: allow the answer to be injected without a real terminal.
+    if let Ok(answer) = std::env::var("DEV_REBUILD_ANSWER") {
+        return matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    }
+    eprintln!("The dev container config has changed since this container was built.");
+    eprint!("Rebuild now? [y/N] ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Whether the current run is interactive. `DEV_FORCE_TTY` overrides the
+/// terminal check so tests can exercise both branches deterministically.
+fn is_interactive() -> bool {
+    match std::env::var("DEV_FORCE_TTY") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => std::io::stdin().is_terminal(),
+    }
+}
 
 /// The retry schedule every part of the readiness gate follows.
 ///
@@ -1665,9 +1730,9 @@ fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_cli_overrides, apply_run_args_capabilities, ensure_image_present, parse_mounts,
-        parse_single_mount, project_declares_run_args, reject_project_run_args_for_compose,
-        substitute_mounts,
+        CONFIG_HASH_LABEL, apply_cli_overrides, apply_run_args_capabilities, ensure_image_present,
+        parse_mounts, parse_single_mount, project_declares_run_args,
+        reject_project_run_args_for_compose, substitute_mounts,
     };
     use crate::devcontainer::config::{DevcontainerConfig, MountObject, MountSpec};
     use crate::devcontainer::effective::load_effective_config_value;
@@ -1682,6 +1747,20 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    /// Serializes tests that set `DEV_FORCE_TTY`/`DEV_REBUILD_ANSWER`, since
+    /// process-global env vars would otherwise race across parallel tests.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Set an env var for a test (unsafe in current Rust; wrapped here).
+    fn set_test_env(key: &str, value: &str) {
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    /// Remove an env var set by a test.
+    fn remove_test_env(key: &str) {
+        unsafe { std::env::remove_var(key) };
+    }
 
     fn unused<T>() -> BoxFut<'static, T> {
         Box::pin(async {
@@ -2252,6 +2331,27 @@ mod tests {
             self
         }
 
+        /// Seed a running container whose stored config fingerprint differs from
+        /// the current effective config, standing in for a config edit since
+        /// the container was built.
+        fn already_running_stale(self, workspace: &Path, config_path: &Path) -> Self {
+            self.containers.lock().unwrap().push(ContainerInfo {
+                id: "already-running-id".to_string(),
+                name: "already-running".to_string(),
+                state: ContainerState::Running,
+                labels: {
+                    let mut labels: HashMap<String, String> =
+                        workspace_labels(workspace, Some(config_path))
+                            .into_iter()
+                            .collect();
+                    labels.insert(CONFIG_HASH_LABEL.to_string(), "stale-hash".to_string());
+                    labels
+                },
+                image: "ubuntu:24.04".to_string(),
+            });
+            self
+        }
+
         fn already_stopped(self, workspace: &Path, config_path: &Path) -> Self {
             self.containers.lock().unwrap().push(ContainerInfo {
                 id: "already-stopped-id".to_string(),
@@ -2359,12 +2459,26 @@ mod tests {
             })
         }
 
-        fn stop_container(&self, _id: &str) -> BoxFut<'_, ()> {
-            unused()
+        fn stop_container(&self, id: &str) -> BoxFut<'_, ()> {
+            let id = id.to_string();
+            let containers = self.containers.clone();
+            Box::pin(async move {
+                for container in containers.lock().unwrap().iter_mut() {
+                    if container.id == id {
+                        container.state = ContainerState::Stopped;
+                    }
+                }
+                Ok(())
+            })
         }
 
-        fn remove_container(&self, _id: &str) -> BoxFut<'_, ()> {
-            unused()
+        fn remove_container(&self, id: &str) -> BoxFut<'_, ()> {
+            let id = id.to_string();
+            let containers = self.containers.clone();
+            Box::pin(async move {
+                containers.lock().unwrap().retain(|c| c.id != id);
+                Ok(())
+            })
         }
 
         fn exec(
@@ -2537,6 +2651,14 @@ mod tests {
 
     /// Drive `run_with_runtime` over a minimal image-based workspace.
     async fn run_up_with_fake(rt: &UpFakeRuntime, workspace: &TempDir) -> anyhow::Result<()> {
+        run_up_with_fake_flags(rt, workspace, false).await
+    }
+
+    async fn run_up_with_fake_flags(
+        rt: &UpFakeRuntime,
+        workspace: &TempDir,
+        reuse: bool,
+    ) -> anyhow::Result<()> {
         super::run_with_runtime(
             workspace.path(),
             rt,
@@ -2547,6 +2669,7 @@ mod tests {
             /* update_remote_user_uid_default */ "never",
             /* port_overrides */ &[],
             /* no_base */ true,
+            /* reuse */ reuse,
         )
         .await
     }
@@ -3018,6 +3141,101 @@ mod tests {
             rt.created_config.lock().unwrap().is_none(),
             "a usable running container must not be recreated"
         );
+    }
+
+    /// A config edit since the container was built (drift) must not silently
+    /// reuse in a non-interactive context: it warns and reuses, never blocks.
+    #[tokio::test(start_paused = true)]
+    async fn up_warns_and_reuses_when_config_drifted_non_tty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_test_env("DEV_FORCE_TTY", "0");
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::ok().already_running_stale(workspace.path(), &config_path);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("a drifted config in a non-TTY context must warn and reuse");
+        assert!(
+            rt.created_config.lock().unwrap().is_none(),
+            "non-TTY drift must not rebuild without consent"
+        );
+        remove_test_env("DEV_FORCE_TTY");
+    }
+
+    /// A config edit since the container was built, with the user accepting the
+    /// rebuild prompt, must recreate the container from the new config.
+    #[tokio::test(start_paused = true)]
+    async fn up_rebuilds_when_config_drifted_and_user_accepts() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_test_env("DEV_FORCE_TTY", "1");
+        set_test_env("DEV_REBUILD_ANSWER", "y");
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::ok().already_running_stale(workspace.path(), &config_path);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("accepting the rebuild prompt must succeed");
+        assert!(
+            rt.created_config.lock().unwrap().is_some(),
+            "accepting the rebuild prompt must recreate the container"
+        );
+        remove_test_env("DEV_FORCE_TTY");
+        remove_test_env("DEV_REBUILD_ANSWER");
+    }
+
+    /// A config edit since the container was built, with the user declining the
+    /// rebuild prompt, must reuse the existing container.
+    #[tokio::test(start_paused = true)]
+    async fn up_reuses_when_config_drifted_and_user_declines() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        set_test_env("DEV_FORCE_TTY", "1");
+        set_test_env("DEV_REBUILD_ANSWER", "n");
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::ok().already_running_stale(workspace.path(), &config_path);
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("declining the rebuild prompt must reuse");
+        assert!(
+            rt.created_config.lock().unwrap().is_none(),
+            "declining the rebuild prompt must not recreate the container"
+        );
+        remove_test_env("DEV_FORCE_TTY");
+        remove_test_env("DEV_REBUILD_ANSWER");
+    }
+
+    /// `--reuse` must skip the rebuild prompt entirely and reuse the existing
+    /// container even when the config has drifted.
+    #[tokio::test(start_paused = true)]
+    async fn up_reuse_flag_skips_rebuild_prompt() {
+        let workspace = TempDir::new().unwrap();
+        let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::ok().already_running_stale(workspace.path(), &config_path);
+        run_up_with_fake_flags(&rt, &workspace, true)
+            .await
+            .expect("--reuse must reuse the existing container");
+        assert!(
+            rt.created_config.lock().unwrap().is_none(),
+            "--reuse must not recreate the container"
+        );
+    }
+
+    /// The effective config fingerprint must be persisted as a container label
+    /// at create time so a later `dev up` can detect drift.
+    #[tokio::test(start_paused = true)]
+    async fn up_persists_config_hash_label() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("up should succeed with a cooperating fake runtime");
+        let created = rt.created_config();
+        let hash = created
+            .labels
+            .get(CONFIG_HASH_LABEL)
+            .expect("config hash label must be set at create time");
+        assert!(!hash.is_empty(), "config hash must not be empty");
     }
 
     /// Reusing a running Docker/Podman container is the trigger; the masking

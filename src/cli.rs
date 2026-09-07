@@ -92,6 +92,10 @@ pub enum Command {
         /// Do not apply ~/.dev/base/devcontainer.json for this run
         #[arg(long)]
         no_base: bool,
+
+        /// Reuse the existing container even if the config has changed (skip the rebuild prompt)
+        #[arg(long)]
+        reuse: bool,
     },
 
     /// Stop (optionally remove) container
@@ -295,7 +299,11 @@ pub enum ConfigAction {
     },
 
     /// Show current configuration summary
-    List,
+    List {
+        /// Show the effective (base + project + CLI) merged config instead of a single layer
+        #[arg(long)]
+        effective: bool,
+    },
 }
 
 #[cfg(test)]

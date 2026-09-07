@@ -7,11 +7,13 @@ use serde_json::Value;
 use crate::cli::ConfigAction;
 use crate::collection::{fetch_all_features, fetch_collection_index};
 use crate::devcontainer::compose::compose_recipe_config;
+use crate::devcontainer::effective::load_effective_config_value;
 use crate::devcontainer::recipe::Recipe;
 use crate::runtime::{
     ACCEPTED_RUNTIME_VALUES, DEFAULT_RUNTIME_PROPERTY, RuntimeName, detect_runtime,
 };
 use crate::tui::prompts;
+use crate::util::paths::base_config_dir;
 use crate::util::workspace::{ConfigSource, find_config_source};
 
 /// Tracks where config changes should be written.
@@ -111,7 +113,7 @@ async fn run_with_target(
         Some(ConfigAction::Unset { property }) => config_unset(target, &property),
         Some(ConfigAction::Add { property, value }) => config_add(target, &property, &value),
         Some(ConfigAction::Remove { property, value }) => config_remove(target, &property, &value),
-        Some(ConfigAction::List) => config_list(target),
+        Some(ConfigAction::List { effective }) => config_list(target, effective),
         None => interactive(target, verbose).await,
     }
 }
@@ -167,6 +169,29 @@ fn read_target_config(target: &ConfigTarget<'_>) -> anyhow::Result<Value> {
         .config_path
         .ok_or_else(|| anyhow::anyhow!("No devcontainer.json path for config target"))?;
     read_config(path)
+}
+
+/// The effective (base + project) config value, mirroring what `dev up` builds
+/// from. Recipe targets already carry the composed value; direct targets merge
+/// the base layer in memory.
+fn effective_config_value(target: &ConfigTarget<'_>) -> anyhow::Result<Value> {
+    effective_config_value_with_base(target, &base_config_dir().join("devcontainer.json"))
+}
+
+/// [`effective_config_value`] with an explicit base path, so tests can drive the
+/// merge against a temporary base config without touching the real `~/.dev/`.
+fn effective_config_value_with_base(
+    target: &ConfigTarget<'_>,
+    base_path: &Path,
+) -> anyhow::Result<Value> {
+    if let Some(value) = &target.config_value {
+        return Ok(value.clone());
+    }
+    let path = target
+        .config_path
+        .ok_or_else(|| anyhow::anyhow!("No devcontainer.json path for config target"))?;
+    let (value, _) = load_effective_config_value(path, true, base_path)?;
+    Ok(value)
 }
 
 fn write_target_config(target: &ConfigTarget<'_>, json: &Value) -> anyhow::Result<()> {
@@ -485,8 +510,12 @@ fn config_remove(target: &ConfigTarget<'_>, property: &str, value: &str) -> anyh
     Ok(())
 }
 
-fn config_list(target: &ConfigTarget<'_>) -> anyhow::Result<()> {
-    let json = read_target_config(target)?;
+fn config_list(target: &ConfigTarget<'_>, effective: bool) -> anyhow::Result<()> {
+    let json = if effective {
+        effective_config_value(target)?
+    } else {
+        read_target_config(target)?
+    };
     let obj = json
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
@@ -619,7 +648,7 @@ async fn interactive(target: &ConfigTarget<'_>, verbose: u8) -> anyhow::Result<(
         4 => interactive_mounts(target)?,
         5 => interactive_lifecycle(target)?,
         6 => interactive_other(target)?,
-        7 => config_list(target)?,
+        7 => config_list(target, false)?,
         _ => unreachable!(),
     }
 
@@ -1332,14 +1361,14 @@ mod tests {
             r#"{"postCreateCommand": {"build": "npm run build", "test": "npm test"}}"#,
         );
         // Just verify it doesn't error
-        config_list(&target_for(&path)).unwrap();
+        config_list(&target_for(&path), false).unwrap();
     }
 
     #[test]
     fn test_config_list_lifecycle_array() {
         let (_dir, path) =
             setup_config(r#"{"postCreateCommand": ["npm install", "npm run build"]}"#);
-        config_list(&target_for(&path)).unwrap();
+        config_list(&target_for(&path), false).unwrap();
     }
 
     #[test]
@@ -1369,7 +1398,43 @@ mod tests {
             }"#,
         );
         // Just verify it doesn't error
-        config_list(&target_for(&path)).unwrap();
+        config_list(&target_for(&path), false).unwrap();
+    }
+
+    #[test]
+    fn test_effective_config_merges_base_beneath_project() {
+        let (_dir, path) = setup_config(
+            r#"{
+                "image": "ubuntu",
+                "containerEnv": {"SHARED": "project", "PROJECT_ONLY": "p"}
+            }"#,
+        );
+        let base_dir = TempDir::new().unwrap();
+        let base_path = base_dir.path().join("devcontainer.json");
+        fs::write(
+            &base_path,
+            r#"{"containerEnv": {"SHARED": "base", "BASE_ONLY": "b"}}"#,
+        )
+        .unwrap();
+
+        let value = effective_config_value_with_base(&target_for(&path), &base_path).unwrap();
+
+        // Project wins the conflict; base-only key survives.
+        assert_eq!(value["containerEnv"]["SHARED"], "project");
+        assert_eq!(value["containerEnv"]["PROJECT_ONLY"], "p");
+        assert_eq!(value["containerEnv"]["BASE_ONLY"], "b");
+    }
+
+    #[test]
+    fn test_effective_config_without_base_is_just_the_project() {
+        let (_dir, path) = setup_config(r#"{"image": "ubuntu", "remoteUser": "vscode"}"#);
+        let base_dir = TempDir::new().unwrap();
+        let base_path = base_dir.path().join("devcontainer.json");
+
+        let value = effective_config_value_with_base(&target_for(&path), &base_path).unwrap();
+
+        assert_eq!(value["image"], "ubuntu");
+        assert_eq!(value["remoteUser"], "vscode");
     }
 
     // --- Recipe persistence tests ---
