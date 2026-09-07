@@ -103,6 +103,11 @@ pub struct ContainerConfig {
     pub devices: Vec<String>,
     /// Additional groups to add (--group-add).
     pub group_add: Vec<String>,
+    /// Device cgroup rules (--device-cgroup-rule), e.g. `c 189:* rmw`. Unlike
+    /// `--device`, a rule covers a whole major/minor range, so a device that
+    /// re-enumerates while the container runs (USB replug) stays accessible
+    /// without granting `--privileged`.
+    pub device_cgroup_rules: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

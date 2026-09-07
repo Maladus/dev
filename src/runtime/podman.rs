@@ -230,6 +230,7 @@ mod tests {
             userns_mode: Some("keep-id".to_string()),
             devices: vec![],
             group_add: vec![],
+            device_cgroup_rules: vec!["c 189:* rmw".to_string()],
         };
         config.labels.insert(
             "devcontainer.local_folder".to_string(),
