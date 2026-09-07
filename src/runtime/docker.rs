@@ -6,6 +6,7 @@ use bollard::query_parameters::{
     ListContainersOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
@@ -675,11 +676,15 @@ impl BollardRuntime {
             // Writing to cancel_writer causes the poll() in the reader to
             // wake up and exit cleanly, avoiding a stuck blocking thread that
             // would prevent the tokio runtime from shutting down.
-            let (cancel_reader, cancel_writer) =
+            let (cancel_reader, mut cancel_writer) =
                 os_pipe::pipe().map_err(|e| DevError::Runtime(format!("pipe: {e}")))?;
 
             // Channel to bridge blocking stdin reads → async container writes.
             let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
+            // Signals when the blocking stdin reader thread has fully exited, so
+            // the cleanup can wait on it with a bounded timeout instead of
+            // joining a thread that may be stuck (issue #32).
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
 
             // Blocking stdin reader using poll() so it can be cancelled.
             let stdin_reader_handle = std::thread::spawn(move || {
@@ -702,6 +707,13 @@ impl BollardRuntime {
                     ];
                     let ready = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
                     if ready < 0 {
+                        // A terminal resize delivers SIGWINCH, which can make
+                        // poll return -1 with EINTR. Retry rather than exiting
+                        // the reader (issue #41), or input freezes on resize.
+                        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                        {
+                            continue;
+                        }
                         break;
                     }
                     if pfds[1].revents & libc::POLLIN != 0 {
@@ -720,6 +732,7 @@ impl BollardRuntime {
                         }
                     }
                 }
+                let _ = done_tx.send(());
             });
 
             // Async task that forwards channel data to the container stdin.
@@ -782,10 +795,20 @@ impl BollardRuntime {
             }
 
             // Signal the blocking stdin reader to exit, then clean up.
+            // Abort the stdin writer first so its channel closes and a reader
+            // blocked in `blocking_send` is unblocked; then wake a reader
+            // blocked in `poll()` by writing to the cancel pipe (closing it
+            // also works, but an explicit write is unambiguous). This is the
+            // issue #32 fix: without it, `dev shell` can hang on exit when the
+            // exec stream ends but the stdin reader never wakes.
+            stdin_abort.abort();
+            let _ = cancel_writer.write(&[1]);
             drop(cancel_writer);
+            // Wait for the reader to exit, but never hang `dev shell` on a
+            // stuck thread (issue #32).
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(2));
             let _ = stdin_reader_handle.join();
 
-            stdin_abort.abort();
             output_abort.abort();
             monitor_abort.abort();
             sigwinch_abort.abort();
