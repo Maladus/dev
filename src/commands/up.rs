@@ -3772,29 +3772,6 @@ mod tests {
         );
     }
 
-<<<<<<< Updated upstream
-=======
-    /// `initializeCommand` runs on the host, so devcontainer variables such as
-    /// `${localEnv:VAR}` must be substituted before `sh` sees them.
-    #[tokio::test]
-    async fn initialize_command_substitutes_local_env_variables() {
-        let _guard = ENV_LOCK.lock().await;
-        set_test_env("DEV_TEST_HOME", "/tmp/fake-home");
-        let workspace = TempDir::new().unwrap();
-        let out = workspace.path().join("out.txt");
-        let cmd = format!("echo ${{localEnv:DEV_TEST_HOME}} > {}", out.display());
-        super::run_initialize_command(
-            &crate::devcontainer::config::LifecycleCommand::Single(cmd),
-            workspace.path(),
-        )
-        .await
-        .expect("initializeCommand should run after substitution");
-        let written = fs::read_to_string(&out).unwrap();
-        assert_eq!(written.trim(), "/tmp/fake-home");
-        remove_test_env("DEV_TEST_HOME");
-    }
-
->>>>>>> Stashed changes
     /// Existing-container fast paths must not bypass runArgs validation.
     #[tokio::test(start_paused = true)]
     async fn up_unsupported_runarg_fails_for_existing_running_container() {
