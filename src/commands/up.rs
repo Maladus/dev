@@ -1784,7 +1784,7 @@ mod tests {
 
     /// Serializes tests that set `DEV_FORCE_TTY`/`DEV_REBUILD_ANSWER`, since
     /// process-global env vars would otherwise race across parallel tests.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Set an env var for a test (unsafe in current Rust; wrapped here).
     fn set_test_env(key: &str, value: &str) {
@@ -3208,7 +3208,7 @@ mod tests {
     /// reuse in a non-interactive context: it warns and reuses, never blocks.
     #[tokio::test(start_paused = true)]
     async fn up_warns_and_reuses_when_config_drifted_non_tty() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         set_test_env("DEV_FORCE_TTY", "0");
         let workspace = TempDir::new().unwrap();
         let config_path = write_project_config(&workspace, r#"{"image":"ubuntu:24.04"}"#);
@@ -3227,7 +3227,7 @@ mod tests {
     /// rebuild prompt, must recreate the container from the new config.
     #[tokio::test(start_paused = true)]
     async fn up_rebuilds_when_config_drifted_and_user_accepts() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         set_test_env("DEV_FORCE_TTY", "1");
         set_test_env("DEV_REBUILD_ANSWER", "y");
         let workspace = TempDir::new().unwrap();
@@ -3248,7 +3248,7 @@ mod tests {
     /// rebuild prompt, must reuse the existing container.
     #[tokio::test(start_paused = true)]
     async fn up_reuses_when_config_drifted_and_user_declines() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         set_test_env("DEV_FORCE_TTY", "1");
         set_test_env("DEV_REBUILD_ANSWER", "n");
         let workspace = TempDir::new().unwrap();
@@ -3837,7 +3837,7 @@ mod tests {
     /// `${localEnv:VAR}` must be substituted before `sh` sees them.
     #[tokio::test]
     async fn initialize_command_substitutes_local_env_variables() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         set_test_env("DEV_TEST_HOME", "/tmp/fake-home");
         let workspace = TempDir::new().unwrap();
         let out = workspace.path().join("out.txt");
