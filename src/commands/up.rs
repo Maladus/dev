@@ -1101,10 +1101,14 @@ async fn run_initialize_command(
     use crate::devcontainer::config::LifecycleCommand;
 
     async fn run_one(command: &str, workspace: &Path) -> anyhow::Result<()> {
+        // `initializeCommand` runs on the host, so devcontainer variables such as
+        // `${localEnv:HOME}` must be substituted here (like mounts) rather than
+        // passed through to `sh`, which would fail with "Bad substitution".
+        let command = substitute_variables(command, workspace);
         eprintln!("[lifecycle] Running initializeCommand: {command}");
         let output = tokio::process::Command::new("sh")
             .arg("-c")
-            .arg(command)
+            .arg(&command)
             .current_dir(workspace)
             .status()
             .await?;
@@ -3780,6 +3784,26 @@ mod tests {
             !marker.exists(),
             "initializeCommand must not run before runArgs validation"
         );
+    }
+
+    /// `initializeCommand` runs on the host, so devcontainer variables such as
+    /// `${localEnv:VAR}` must be substituted before `sh` sees them.
+    #[tokio::test]
+    async fn initialize_command_substitutes_local_env_variables() {
+        let _guard = ENV_LOCK.lock().await;
+        set_test_env("DEV_TEST_HOME", "/tmp/fake-home");
+        let workspace = TempDir::new().unwrap();
+        let out = workspace.path().join("out.txt");
+        let cmd = format!("echo ${{localEnv:DEV_TEST_HOME}} > {}", out.display());
+        super::run_initialize_command(
+            &crate::devcontainer::config::LifecycleCommand::Single(cmd),
+            workspace.path(),
+        )
+        .await
+        .expect("initializeCommand should run after substitution");
+        let written = fs::read_to_string(&out).unwrap();
+        assert_eq!(written.trim(), "/tmp/fake-home");
+        remove_test_env("DEV_TEST_HOME");
     }
 
     /// Existing-container fast paths must not bypass runArgs validation.
