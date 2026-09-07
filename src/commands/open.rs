@@ -47,7 +47,14 @@ pub async fn run(
         hex::encode(abs_path.to_string_lossy().as_bytes())
     };
 
-    let uri = format!("vscode-remote://dev-container+{hex}/workspaces/{folder_name}");
+    let uri = if let Ok(distro) = std::env::var("WSL_DISTRO_NAME") {
+        // Docker lives inside WSL, so Windows VS Code's Dev Containers extension
+        // cannot reach it. Open the folder in WSL instead: the Dev Containers
+        // extension then runs inside WSL and uses the WSL Docker socket.
+        format!("vscode-remote://wsl+{distro}{}", abs_path.display())
+    } else {
+        format!("vscode-remote://dev-container+{hex}/workspaces/{folder_name}")
+    };
 
     eprintln!("Opening VS Code attached to container...");
     let status = tokio::process::Command::new(binary)
