@@ -463,12 +463,15 @@ pub(crate) async fn run_with_runtime(
         .collect();
     let volumes = parse_volumes(&volume_strings);
 
-    // `runArgs` env was validated before any side effects. Apply it after the
-    // effective create-time env map. `run_args::resolve_run_args` already
-    // matches Docker CLI precedence by loading all env-files before all
-    // explicit --env/-e entries.
-    for (k, v) in &resolved_run_args.env {
-        env.insert(k.clone(), v.clone());
+    // `runArgs` env was validated before any side effects; the env-file
+    // *contents* are read only here, after initializeCommand has run, so a hook
+    // that writes or refreshes an env file is honoured on the same `dev up`
+    // (Docker reads env files when `docker run` executes, i.e. after the hook).
+    // A missing or malformed file still fails before the container is created.
+    // `load_env` matches Docker CLI precedence by loading all env-files before
+    // all explicit --env/-e entries.
+    for (k, v) in resolved_run_args.load_env()? {
+        env.insert(k, v);
     }
 
     let workspace_folder = config.workspace_folder_path(workspace, remote_user)?;
@@ -3186,6 +3189,59 @@ mod tests {
         let env = rt.created_config().env;
         assert_eq!(env.get("FROM_FILE").map(String::as_str), Some("true"));
         assert_eq!(env.get("GREETING").map(String::as_str), Some("hello"));
+    }
+
+    /// An `initializeCommand` that writes the env-file must be honoured on the
+    /// same `dev up`. Docker reads `--env-file` when `docker run` executes,
+    /// which is after the host hook, so a hook that mints a short-lived secret
+    /// (or refreshes a token) reaches the container it was created for. Reading
+    /// the file during runArgs validation instead made every container inherit
+    /// the *previous* run's contents.
+    #[tokio::test]
+    async fn up_env_file_written_by_initialize_command_reaches_container() {
+        let workspace = TempDir::new().unwrap();
+        let env_path = workspace
+            .path()
+            .join(".devcontainer")
+            .join(".env")
+            .display()
+            .to_string();
+        write_env_file(&workspace, "TOKEN=stale\n");
+        write_project_config(
+            &workspace,
+            &format!(
+                r#"{{"image":"ubuntu:24.04","initializeCommand":"printf 'TOKEN=fresh\n' > {env_path}","runArgs":["--env-file","${{localWorkspaceFolder}}/.devcontainer/.env"]}}"#
+            ),
+        );
+        let rt = UpFakeRuntime::ok();
+        run_up_with_fake(&rt, &workspace)
+            .await
+            .expect("up should succeed with an env-file written by initializeCommand");
+
+        assert_eq!(
+            rt.created_config().env.get("TOKEN").map(String::as_str),
+            Some("fresh"),
+            "env-file contents must be read after initializeCommand, not before"
+        );
+    }
+
+    /// A missing env-file must still fail before the container is created, even
+    /// though the read now happens later in the flow.
+    #[tokio::test]
+    async fn up_missing_env_file_fails_before_container_create() {
+        let workspace = TempDir::new().unwrap();
+        write_project_config(
+            &workspace,
+            r#"{"image":"ubuntu:24.04","runArgs":["--env-file","${localWorkspaceFolder}/.devcontainer/.env"]}"#,
+        );
+        let rt = UpFakeRuntime::ok();
+        let err = run_up_with_fake(&rt, &workspace)
+            .await
+            .expect_err("a missing env-file must fail");
+        assert!(
+            err.to_string().contains("env-file"),
+            "error should name the env-file: {err}"
+        );
     }
 
     /// The `--env-file=PATH` equals-attached form must be accepted too.

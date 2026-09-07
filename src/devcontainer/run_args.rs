@@ -53,7 +53,16 @@ pub type EnvEntry = (String, String);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedRunArgs {
-    pub env: Vec<EnvEntry>,
+    /// Absolute paths of every `--env-file`, in the order they appeared.
+    /// Contents are deliberately *not* read here: `initializeCommand` runs on
+    /// the host after runArgs validation and may create or refresh these files
+    /// (for example a script that mints a short-lived token). Docker reads env
+    /// files when `docker run` executes, i.e. after that hook, so Dev must too.
+    /// Call [`ResolvedRunArgs::load_env`] at container-create time instead.
+    pub env_files: Vec<PathBuf>,
+    /// Explicit `--env`/`-e` entries, in the order they appeared. These come
+    /// from the config itself, so they are safe to resolve during validation.
+    pub env_flags: Vec<EnvEntry>,
     pub cap_add: Vec<String>,
     pub security_opt: Vec<String>,
     pub privileged: bool,
@@ -61,10 +70,27 @@ pub struct ResolvedRunArgs {
     pub userns_mode: Option<String>,
 }
 
+impl ResolvedRunArgs {
+    /// Read every env file, then append the explicit env flags, yielding the
+    /// ordered entries the caller inserts into the create-time env map.
+    ///
+    /// Must be called after `initializeCommand` and before container create, so
+    /// a hook that writes an env file is honoured while a broken file still
+    /// fails before anything is created.
+    pub fn load_env(&self) -> Result<Vec<EnvEntry>, DevError> {
+        let mut entries: Vec<EnvEntry> = Vec::new();
+        for path in &self.env_files {
+            read_env_file_into(&mut entries, path)?;
+        }
+        entries.extend(self.env_flags.iter().cloned());
+        Ok(entries)
+    }
+}
+
 /// Validate and translate the supported `runArgs` subset into the existing
 /// container-create fields Dev already carries.
 pub fn resolve_run_args(args: &[String], workspace: &Path) -> Result<ResolvedRunArgs, DevError> {
-    let mut env_file_entries: Vec<EnvEntry> = Vec::new();
+    let mut env_file_paths: Vec<PathBuf> = Vec::new();
     let mut env_flag_entries: Vec<EnvEntry> = Vec::new();
     let mut resolved = ResolvedRunArgs::default();
     let mut i = 0;
@@ -72,16 +98,10 @@ pub fn resolve_run_args(args: &[String], workspace: &Path) -> Result<ResolvedRun
         let arg = &args[i];
         if let Some(path) = arg.strip_prefix("--env-file=") {
             let path = non_empty_inline_value(arg, path, "--env-file")?;
-            read_env_file_into(
-                &mut env_file_entries,
-                &resolve_env_file_path(path, workspace),
-            )?;
+            env_file_paths.push(resolve_env_file_path(path, workspace));
         } else if arg == "--env-file" {
             let path = next_value(args, &mut i, arg, "--env-file")?;
-            read_env_file_into(
-                &mut env_file_entries,
-                &resolve_env_file_path(&path, workspace),
-            )?;
+            env_file_paths.push(resolve_env_file_path(&path, workspace));
         } else if let Some(rest) = arg.strip_prefix("--env=") {
             push_env_flag_token(&mut env_flag_entries, rest)?;
         } else if arg == "--env" {
@@ -133,8 +153,8 @@ pub fn resolve_run_args(args: &[String], workspace: &Path) -> Result<ResolvedRun
     // Docker CLI reads every env-file first, then applies every explicit
     // --env/-e value after, regardless of interleaving. Preserve relative
     // order within each group.
-    resolved.env = env_file_entries;
-    resolved.env.extend(env_flag_entries);
+    resolved.env_files = env_file_paths;
+    resolved.env_flags = env_flag_entries;
     Ok(resolved)
 }
 
@@ -371,7 +391,7 @@ mod tests {
 
     fn resolve(args: &[&str], workspace: &Path) -> Result<Vec<EnvEntry>, DevError> {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        resolve_run_args(&args, workspace).map(|resolved| resolved.env)
+        resolve_run_args(&args, workspace).and_then(|resolved| resolved.load_env())
     }
 
     fn env_map(entries: &[EnvEntry]) -> std::collections::HashMap<String, String> {
