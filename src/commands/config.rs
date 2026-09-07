@@ -531,10 +531,34 @@ fn config_list(target: &ConfigTarget<'_>, show_origin: bool) -> anyhow::Result<(
     };
     let origin = |key: &str| -> String {
         match &origins {
-            Some(map) => format!(
+            Some(o) => format!(
                 "[{}] ",
-                map.get(key).map(String::as_str).unwrap_or("project")
+                o.keys.get(key).map(String::as_str).unwrap_or("project")
             ),
+            None => String::new(),
+        }
+    };
+    // Per-element origin for a merged array key, or empty when not annotating.
+    let elem_origin = |key: &str, i: usize| -> String {
+        match &origins {
+            Some(o) => o
+                .array_elements
+                .get(key)
+                .and_then(|v| v.get(i))
+                .map(|s| format!("[{s}] "))
+                .unwrap_or_default(),
+            None => String::new(),
+        }
+    };
+    // Per-key origin for a merged map key, or empty when not annotating.
+    let map_origin = |key: &str, sub: &str| -> String {
+        match &origins {
+            Some(o) => o
+                .map_elements
+                .get(key)
+                .and_then(|m| m.get(sub))
+                .map(|s| format!("[{s}] "))
+                .unwrap_or_default(),
             None => String::new(),
         }
     };
@@ -564,7 +588,7 @@ fn config_list(target: &ConfigTarget<'_>, show_origin: bool) -> anyhow::Result<(
     {
         println!("{}features:", origin("features"));
         for key in features.keys() {
-            println!("  - {key}");
+            println!("  {}- {key}", map_origin("features", key));
         }
     }
 
@@ -572,7 +596,11 @@ fn config_list(target: &ConfigTarget<'_>, show_origin: bool) -> anyhow::Result<(
     if let Some(ports) = obj.get("forwardPorts").and_then(|v| v.as_array())
         && !ports.is_empty()
     {
-        let ports_str: Vec<String> = ports.iter().map(format_value).collect();
+        let ports_str: Vec<String> = ports
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("{}{}", elem_origin("forwardPorts", i), format_value(p)))
+            .collect();
         println!(
             "{}forwardPorts: {}",
             origin("forwardPorts"),
@@ -587,7 +615,7 @@ fn config_list(target: &ConfigTarget<'_>, show_origin: bool) -> anyhow::Result<(
         {
             println!("{}{key}:", origin(key));
             for (k, v) in env {
-                println!("  {k}={}", format_value(v));
+                println!("  {}{k}={}", map_origin(key, k), format_value(v));
             }
         }
     }
@@ -597,8 +625,8 @@ fn config_list(target: &ConfigTarget<'_>, show_origin: bool) -> anyhow::Result<(
         && !mounts.is_empty()
     {
         println!("{}mounts:", origin("mounts"));
-        for m in mounts {
-            println!("  - {}", format_value(m));
+        for (i, m) in mounts.iter().enumerate() {
+            println!("  {}- {}", elem_origin("mounts", i), format_value(m));
         }
     }
 
@@ -633,8 +661,21 @@ fn config_list(target: &ConfigTarget<'_>, show_origin: bool) -> anyhow::Result<(
 }
 
 /// Which layer each top-level key came from: `base`, `project`, or `both`.
-fn config_origins(target: &ConfigTarget<'_>) -> anyhow::Result<HashMap<String, String>> {
+fn config_origins(target: &ConfigTarget<'_>) -> anyhow::Result<ConfigOrigins> {
     config_origins_with_base(target, &base_config_dir().join("devcontainer.json"))
+}
+
+/// Per-layer provenance for the effective config, mirroring
+/// `git config --list --show-origin` but at element granularity for merged
+/// collections (arrays concatenate, maps merge, so each entry has its own
+/// origin).
+struct ConfigOrigins {
+    /// Top-level key → `base` | `project` | `both`.
+    keys: HashMap<String, String>,
+    /// Array keys (`mounts`, `forwardPorts`, `runArgs`) → per-element origin.
+    array_elements: HashMap<String, Vec<String>>,
+    /// Map keys (`containerEnv`, `remoteEnv`, `features`) → sub-key → origin.
+    map_elements: HashMap<String, HashMap<String, String>>,
 }
 
 /// [`config_origins`] with an explicit base path, so tests can drive the
@@ -642,26 +683,24 @@ fn config_origins(target: &ConfigTarget<'_>) -> anyhow::Result<HashMap<String, S
 fn config_origins_with_base(
     target: &ConfigTarget<'_>,
     base_path: &Path,
-) -> anyhow::Result<HashMap<String, String>> {
+) -> anyhow::Result<ConfigOrigins> {
     let base = if base_path.is_file() {
         read_config(base_path).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
     } else {
         Value::Object(serde_json::Map::new())
     };
     let project = read_target_config(target)?;
-    let base_keys: std::collections::HashSet<String> = base
-        .as_object()
-        .map(|o| o.keys().cloned().collect())
-        .unwrap_or_default();
-    let project_keys: std::collections::HashSet<String> = project
-        .as_object()
-        .map(|o| o.keys().cloned().collect())
-        .unwrap_or_default();
-    let mut origins = HashMap::new();
-    for key in base_keys.union(&project_keys) {
-        let in_base = base_keys.contains(key);
-        let in_project = project_keys.contains(key);
-        origins.insert(
+    let base_obj = base.as_object().cloned().unwrap_or_default();
+    let project_obj = project.as_object().cloned().unwrap_or_default();
+
+    let mut keys = HashMap::new();
+    let mut array_elements = HashMap::new();
+    let mut map_elements = HashMap::new();
+
+    for key in base_obj.keys().chain(project_obj.keys()) {
+        let in_base = base_obj.contains_key(key);
+        let in_project = project_obj.contains_key(key);
+        keys.insert(
             key.clone(),
             match (in_base, in_project) {
                 (true, true) => "both".to_string(),
@@ -669,8 +708,68 @@ fn config_origins_with_base(
                 _ => "project".to_string(),
             },
         );
+
+        // Per-element origin for merged collections.
+        if matches!(key.as_str(), "mounts" | "forwardPorts" | "runArgs") {
+            let base_arr = base_obj
+                .get(key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let proj_arr = project_obj
+                .get(key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let merged = base_arr.iter().chain(proj_arr.iter());
+            let mut seen = std::collections::HashSet::new();
+            let mut origins = Vec::new();
+            for item in merged {
+                if !seen.insert(item.clone()) {
+                    continue;
+                }
+                let in_base = base_arr.contains(item);
+                let in_proj = proj_arr.contains(item);
+                origins.push(match (in_base, in_proj) {
+                    (true, true) => "both".to_string(),
+                    (true, false) => "base".to_string(),
+                    _ => "project".to_string(),
+                });
+            }
+            array_elements.insert(key.clone(), origins);
+        } else if matches!(key.as_str(), "containerEnv" | "remoteEnv" | "features") {
+            let base_map = base_obj
+                .get(key)
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let proj_map = project_obj
+                .get(key)
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let mut sub = HashMap::new();
+            for sub_key in base_map.keys().chain(proj_map.keys()) {
+                let in_base = base_map.contains_key(sub_key);
+                let in_proj = proj_map.contains_key(sub_key);
+                sub.insert(
+                    sub_key.clone(),
+                    match (in_base, in_proj) {
+                        (true, true) => "both".to_string(),
+                        (true, false) => "base".to_string(),
+                        _ => "project".to_string(),
+                    },
+                );
+            }
+            map_elements.insert(key.clone(), sub);
+        }
     }
-    Ok(origins)
+
+    Ok(ConfigOrigins {
+        keys,
+        array_elements,
+        map_elements,
+    })
 }
 
 fn format_value(val: &Value) -> String {
@@ -1507,29 +1606,42 @@ mod tests {
             r#"{
                 "image": "ubuntu",
                 "containerEnv": {"SHARED": "project"},
-                "forwardPorts": [3000]
+                "forwardPorts": [3000],
+                "mounts": ["./proj:/proj"]
             }"#,
         );
         let base_dir = TempDir::new().unwrap();
         let base_path = base_dir.path().join("devcontainer.json");
         fs::write(
             &base_path,
-            r#"{"containerEnv": {"SHARED": "base"}, "mounts": ["./x:/x"]}"#,
+            r#"{"containerEnv": {"SHARED": "base"}, "mounts": ["./base:/base"]}"#,
         )
         .unwrap();
 
         let origins = config_origins_with_base(&target_for(&path), &base_path).unwrap();
 
-        assert_eq!(origins.get("image").map(String::as_str), Some("project"));
-        assert_eq!(origins.get("mounts").map(String::as_str), Some("base"));
         assert_eq!(
-            origins.get("containerEnv").map(String::as_str),
+            origins.keys.get("image").map(String::as_str),
+            Some("project")
+        );
+        assert_eq!(origins.keys.get("mounts").map(String::as_str), Some("both"));
+        assert_eq!(
+            origins.keys.get("containerEnv").map(String::as_str),
             Some("both")
         );
         assert_eq!(
-            origins.get("forwardPorts").map(String::as_str),
+            origins.keys.get("forwardPorts").map(String::as_str),
             Some("project")
         );
+
+        // Per-element origins for the merged mounts array.
+        let mount_origins = origins.array_elements.get("mounts").unwrap();
+        assert_eq!(mount_origins[0], "base");
+        assert_eq!(mount_origins[1], "project");
+
+        // Per-key origins for the merged containerEnv map.
+        let env_origins = origins.map_elements.get("containerEnv").unwrap();
+        assert_eq!(env_origins.get("SHARED").map(String::as_str), Some("both"));
     }
 
     // --- Recipe persistence tests ---
