@@ -477,7 +477,9 @@ dev config unset <property>
 dev config remove <property> <value>
 dev config list
 
-dev config list --effective   # show the merged base + project config, like `git config --list`
+dev config list --show-origin   # annotate each value with base/project, like `git config --list --show-origin`
+
+`dev config list` shows the effective (base + project) merged config by default, like `git config --list`; `--show-origin` annotates each value with the layer it came from.
 
 dev global new  [--name <n>] [--template <id>]
 dev global list

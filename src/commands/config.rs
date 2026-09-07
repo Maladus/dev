@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -113,7 +114,7 @@ async fn run_with_target(
         Some(ConfigAction::Unset { property }) => config_unset(target, &property),
         Some(ConfigAction::Add { property, value }) => config_add(target, &property, &value),
         Some(ConfigAction::Remove { property, value }) => config_remove(target, &property, &value),
-        Some(ConfigAction::List { effective }) => config_list(target, effective),
+        Some(ConfigAction::List { show_origin }) => config_list(target, show_origin),
         None => interactive(target, verbose).await,
     }
 }
@@ -510,15 +511,33 @@ fn config_remove(target: &ConfigTarget<'_>, property: &str, value: &str) -> anyh
     Ok(())
 }
 
-fn config_list(target: &ConfigTarget<'_>, effective: bool) -> anyhow::Result<()> {
-    let json = if effective {
-        effective_config_value(target)?
-    } else {
+fn config_list(target: &ConfigTarget<'_>, show_origin: bool) -> anyhow::Result<()> {
+    // Git-style: the workspace view shows the effective (base + project) merged
+    // config by default. The base view shows the base config alone.
+    let json = if target.kind == ConfigTargetKind::Base {
         read_target_config(target)?
+    } else {
+        effective_config_value(target)?
     };
     let obj = json
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("devcontainer.json is not a JSON object"))?;
+    // `git config --list --show-origin`-style provenance: which layer each key
+    // came from. Only meaningful for the merged workspace view.
+    let origins = if show_origin && target.kind != ConfigTargetKind::Base {
+        Some(config_origins(target)?)
+    } else {
+        None
+    };
+    let origin = |key: &str| -> String {
+        match &origins {
+            Some(map) => format!(
+                "[{}] ",
+                map.get(key).map(String::as_str).unwrap_or("project")
+            ),
+            None => String::new(),
+        }
+    };
 
     let scalar_keys: Vec<&str> = if target.kind == ConfigTargetKind::Base {
         vec![
@@ -535,7 +554,7 @@ fn config_list(target: &ConfigTarget<'_>, effective: bool) -> anyhow::Result<()>
     // Scalars
     for key in &scalar_keys {
         if let Some(val) = obj.get(*key) {
-            println!("{key}: {}", format_value(val));
+            println!("{}{key}: {}", origin(key), format_value(val));
         }
     }
 
@@ -543,7 +562,7 @@ fn config_list(target: &ConfigTarget<'_>, effective: bool) -> anyhow::Result<()>
     if let Some(features) = obj.get("features").and_then(|v| v.as_object())
         && !features.is_empty()
     {
-        println!("features:");
+        println!("{}features:", origin("features"));
         for key in features.keys() {
             println!("  - {key}");
         }
@@ -554,7 +573,11 @@ fn config_list(target: &ConfigTarget<'_>, effective: bool) -> anyhow::Result<()>
         && !ports.is_empty()
     {
         let ports_str: Vec<String> = ports.iter().map(format_value).collect();
-        println!("forwardPorts: {}", ports_str.join(", "));
+        println!(
+            "{}forwardPorts: {}",
+            origin("forwardPorts"),
+            ports_str.join(", ")
+        );
     }
 
     // Env maps
@@ -562,7 +585,7 @@ fn config_list(target: &ConfigTarget<'_>, effective: bool) -> anyhow::Result<()>
         if let Some(env) = obj.get(key).and_then(|v| v.as_object())
             && !env.is_empty()
         {
-            println!("{key}:");
+            println!("{}{key}:", origin(key));
             for (k, v) in env {
                 println!("  {k}={}", format_value(v));
             }
@@ -573,7 +596,7 @@ fn config_list(target: &ConfigTarget<'_>, effective: bool) -> anyhow::Result<()>
     if let Some(mounts) = obj.get("mounts").and_then(|v| v.as_array())
         && !mounts.is_empty()
     {
-        println!("mounts:");
+        println!("{}mounts:", origin("mounts"));
         for m in mounts {
             println!("  - {}", format_value(m));
         }
@@ -583,13 +606,13 @@ fn config_list(target: &ConfigTarget<'_>, effective: bool) -> anyhow::Result<()>
     for key in LIFECYCLE_COMMANDS {
         if let Some(val) = obj.get(*key) {
             match val {
-                Value::String(s) => println!("{key}: {s}"),
+                Value::String(s) => println!("{}{key}: {s}", origin(key)),
                 Value::Array(arr) => {
                     let cmds: Vec<String> = arr.iter().map(format_value).collect();
-                    println!("{key}: [{}]", cmds.join(", "));
+                    println!("{}{key}: [{}]", origin(key), cmds.join(", "));
                 }
                 Value::Object(map) => {
-                    println!("{key}:");
+                    println!("{}{key}:", origin(key));
                     for (label, cmd) in map {
                         match cmd {
                             Value::String(s) => println!("  {label}: {s}"),
@@ -601,12 +624,53 @@ fn config_list(target: &ConfigTarget<'_>, effective: bool) -> anyhow::Result<()>
                         }
                     }
                 }
-                other => println!("{key}: {}", format_value(other)),
+                other => println!("{}{key}: {}", origin(key), format_value(other)),
             }
         }
     }
 
     Ok(())
+}
+
+/// Which layer each top-level key came from: `base`, `project`, or `both`.
+fn config_origins(target: &ConfigTarget<'_>) -> anyhow::Result<HashMap<String, String>> {
+    config_origins_with_base(target, &base_config_dir().join("devcontainer.json"))
+}
+
+/// [`config_origins`] with an explicit base path, so tests can drive the
+/// provenance against a temporary base config without touching the real `~/.dev/`.
+fn config_origins_with_base(
+    target: &ConfigTarget<'_>,
+    base_path: &Path,
+) -> anyhow::Result<HashMap<String, String>> {
+    let base = if base_path.is_file() {
+        read_config(base_path).unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+    let project = read_target_config(target)?;
+    let base_keys: std::collections::HashSet<String> = base
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    let project_keys: std::collections::HashSet<String> = project
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut origins = HashMap::new();
+    for key in base_keys.union(&project_keys) {
+        let in_base = base_keys.contains(key);
+        let in_project = project_keys.contains(key);
+        origins.insert(
+            key.clone(),
+            match (in_base, in_project) {
+                (true, true) => "both".to_string(),
+                (true, false) => "base".to_string(),
+                _ => "project".to_string(),
+            },
+        );
+    }
+    Ok(origins)
 }
 
 fn format_value(val: &Value) -> String {
@@ -1435,6 +1499,37 @@ mod tests {
 
         assert_eq!(value["image"], "ubuntu");
         assert_eq!(value["remoteUser"], "vscode");
+    }
+
+    #[test]
+    fn test_config_origins_annotate_base_project_and_both() {
+        let (_dir, path) = setup_config(
+            r#"{
+                "image": "ubuntu",
+                "containerEnv": {"SHARED": "project"},
+                "forwardPorts": [3000]
+            }"#,
+        );
+        let base_dir = TempDir::new().unwrap();
+        let base_path = base_dir.path().join("devcontainer.json");
+        fs::write(
+            &base_path,
+            r#"{"containerEnv": {"SHARED": "base"}, "mounts": ["./x:/x"]}"#,
+        )
+        .unwrap();
+
+        let origins = config_origins_with_base(&target_for(&path), &base_path).unwrap();
+
+        assert_eq!(origins.get("image").map(String::as_str), Some("project"));
+        assert_eq!(origins.get("mounts").map(String::as_str), Some("base"));
+        assert_eq!(
+            origins.get("containerEnv").map(String::as_str),
+            Some("both")
+        );
+        assert_eq!(
+            origins.get("forwardPorts").map(String::as_str),
+            Some("project")
+        );
     }
 
     // --- Recipe persistence tests ---

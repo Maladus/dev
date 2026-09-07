@@ -300,9 +300,9 @@ pub enum ConfigAction {
 
     /// Show current configuration summary
     List {
-        /// Show the effective (base + project + CLI) merged config instead of a single layer
+        /// Show which layer (base or project) each value came from
         #[arg(long)]
-        effective: bool,
+        show_origin: bool,
     },
 }
 
