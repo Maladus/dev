@@ -1661,6 +1661,9 @@ fn parse_single_mount(s: &str) -> Option<BindMount> {
     if s.starts_with('/') || s.starts_with('.') {
         let parts: Vec<&str> = s.split(':').collect();
         if parts.len() >= 2 {
+            if parts[0].is_empty() {
+                return None;
+            }
             let readonly = parts.get(2).map(|&p| p == "ro").unwrap_or(false);
             return Some(BindMount {
                 source: PathBuf::from(parts[0]),
@@ -1694,7 +1697,7 @@ fn parse_single_mount(s: &str) -> Option<BindMount> {
     }
 
     match (source, target) {
-        (Some(src), Some(tgt)) => Some(BindMount {
+        (Some(src), Some(tgt)) if !src.is_empty() => Some(BindMount {
             source: PathBuf::from(src),
             target: tgt,
             readonly,
@@ -2052,6 +2055,14 @@ mod tests {
         assert_eq!(m.source, std::path::PathBuf::from("./"));
         assert_eq!(m.target, "/workspace");
         assert!(m.readonly);
+    }
+
+    /// A mount whose source is empty (e.g. an unset `${localEnv:...}` variable)
+    /// must be skipped, not handed to the daemon as an invalid volume spec.
+    #[test]
+    fn parse_single_mount_skips_empty_source() {
+        assert!(parse_single_mount("source=,target=/tmp/ssh-agent.sock,type=bind").is_none());
+        assert!(parse_single_mount(":/tmp/ssh-agent.sock").is_none());
     }
 
     /// `parse_single_mount` must accept a bind-mount long-form string with `ro` flag.
