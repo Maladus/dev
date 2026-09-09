@@ -217,6 +217,83 @@ fn parse_device_mapping(spec: &str) -> bollard::models::DeviceMapping {
     }
 }
 
+/// Extract the registry host from an image reference, defaulting to Docker Hub.
+///
+/// `qumearegistryeu.azurecr.io/qumea-ticss-builder:V1.0.4` -> `qumearegistryeu.azurecr.io`,
+/// `ubuntu:latest` -> `docker.io`, `localhost:5000/foo:tag` -> `localhost:5000`.
+fn registry_host(image: &str) -> String {
+    // Drop the digest (`name@sha256:...`) and tag (`name:tag`) before looking
+    // at the first path component.
+    let name = image.split('@').next().unwrap_or(image);
+    let name = match name.rfind('/') {
+        Some(slash) => match name[slash..].find(':') {
+            Some(colon) => &name[..slash + colon],
+            None => name,
+        },
+        None => match name.find(':') {
+            Some(colon) => &name[..colon],
+            None => name,
+        },
+    };
+    let first = name.split('/').next().unwrap_or(name);
+    if first.contains('.') || first.contains(':') || first == "localhost" {
+        first.to_string()
+    } else {
+        "docker.io".to_string()
+    }
+}
+
+/// Normalize an `auths` key from `~/.docker/config.json` to a bare registry host.
+///
+/// Keys may carry a scheme (`https://...`) and a trailing path
+/// (`https://index.docker.io/v1/`), and Docker Hub is spelled several ways.
+fn normalize_registry_key(key: &str) -> String {
+    let key = key.trim();
+    let key = key
+        .strip_prefix("https://")
+        .or_else(|| key.strip_prefix("http://"))
+        .unwrap_or(key);
+    let key = key.trim_end_matches('/');
+    if key == "index.docker.io/v1"
+        || key.starts_with("index.docker.io")
+        || key.starts_with("registry-1.docker.io")
+    {
+        return "docker.io".to_string();
+    }
+    key.to_string()
+}
+
+/// Load registry credentials for an image from `~/.docker/config.json`.
+///
+/// The Docker CLI reads these and sends them as `X-Registry-Auth` when pulling.
+/// `dev` talks to the daemon through bollard directly, so it must do the same
+/// or private registries reject the pull with 401 even though `docker pull`
+/// succeeds. Returns `None` when no matching entry exists (anonymous pull).
+fn docker_credentials_for(image: &str) -> Option<bollard::auth::DockerCredentials> {
+    let registry = registry_host(image);
+    let config_path = dirs::home_dir()?.join(".docker").join("config.json");
+    let raw = std::fs::read_to_string(config_path).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let auths = config.get("auths")?.as_object()?;
+
+    for (key, value) in auths {
+        if normalize_registry_key(key) != registry {
+            continue;
+        }
+        let str_field = |name: &str| value.get(name).and_then(|v| v.as_str()).map(String::from);
+        return Some(bollard::auth::DockerCredentials {
+            username: str_field("username"),
+            password: str_field("password"),
+            auth: str_field("auth"),
+            email: str_field("email"),
+            serveraddress: Some(key.clone()),
+            identitytoken: str_field("identitytoken"),
+            registrytoken: str_field("registrytoken"),
+        });
+    }
+    None
+}
+
 impl BollardRuntime {
     /// Connect to a specific socket path.
     pub fn connect_to_socket(socket: &str) -> Result<Self, DevError> {
@@ -247,13 +324,18 @@ impl BollardRuntime {
             from_image: Some(image.to_string()),
             ..Default::default()
         };
-        // Pass a default (empty) DockerCredentials instead of None. When None
-        // is passed, bollard sends an empty X-Registry-Auth header value which
+        // Load registry credentials from ~/.docker/config.json so private
+        // registries (e.g. Azure ACR) accept the pull. The Docker CLI does this
+        // itself; bollard talks to the daemon directly, so without it the pull
+        // is anonymous and the registry answers 401 even though `docker pull`
+        // succeeds. Fall back to empty credentials (not None) when no entry
+        // matches: None makes bollard send an empty X-Registry-Auth value that
         // Podman rejects as invalid JSON.
+        let credentials = docker_credentials_for(image).unwrap_or_default();
         let mut stream = self.client.create_image(
             Some(opts),
             None,
-            Some(bollard::auth::DockerCredentials::default()),
+            Some(credentials),
         );
         while let Some(result) = stream.next().await {
             result?;
