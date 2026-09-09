@@ -18,6 +18,8 @@ struct FeatureJsonMeta {
     #[serde(default)]
     depends_on: Option<HashMap<String, serde_json::Value>>,
     #[serde(default)]
+    options: Option<HashMap<String, FeatureOption>>,
+    #[serde(default)]
     container_env: Option<HashMap<String, String>>,
     #[serde(default)]
     mounts: Option<Vec<serde_json::Value>>,
@@ -39,6 +41,16 @@ struct FeatureJsonMeta {
     post_start_command: Option<serde_json::Value>,
     #[serde(default)]
     post_attach_command: Option<serde_json::Value>,
+}
+
+/// A single option declared by a feature in its `devcontainer-feature.json`.
+///
+/// Only the `default` is needed here: it is merged into the user's options so
+/// install scripts always see a value for every declared option.
+#[derive(Deserialize, Default)]
+struct FeatureOption {
+    #[serde(default)]
+    default: Option<serde_json::Value>,
 }
 
 /// A resolved devcontainer feature ready for installation.
@@ -365,6 +377,9 @@ fn apply_feature_metadata(feature: &mut ResolvedFeature, meta: &FeatureJsonMeta)
     if let Some(ref install_after) = meta.install_after {
         feature.install_after = install_after.clone();
     }
+    if let Some(ref options) = meta.options {
+        apply_feature_option_defaults(feature, options);
+    }
     if let Some(ref container_env) = meta.container_env {
         feature.container_env = container_env.clone();
     }
@@ -400,6 +415,27 @@ fn apply_feature_metadata(feature: &mut ResolvedFeature, meta: &FeatureJsonMeta)
     if let Some(ref val) = meta.post_attach_command {
         feature.lifecycle_hooks.post_attach_command = parse_lifecycle_command(val);
     }
+}
+
+/// Merge default option values from `devcontainer-feature.json` into a feature's
+/// user-specified options.
+///
+/// Feature install scripts read their options from environment variables and
+/// expect the orchestrating tool to supply defaults for options the user did not
+/// set. Without this, an option like the git feature's `version` (default
+/// `os-provided`) is left unset, and the install script fails (e.g. "Invalid git
+/// version:").
+fn apply_feature_option_defaults(
+    feature: &mut ResolvedFeature,
+    options: &HashMap<String, FeatureOption>,
+) {
+    let mut merged = feature.options.as_object().cloned().unwrap_or_default();
+    for (name, opt) in options {
+        if let Some(default) = &opt.default {
+            merged.entry(name.clone()).or_insert_with(|| default.clone());
+        }
+    }
+    feature.options = serde_json::Value::Object(merged);
 }
 
 /// Read `depends_on` from a feature's `devcontainer-feature.json`, if present.
@@ -1210,6 +1246,51 @@ mod tests {
         assert_eq!(option_name_to_env("version"), "VERSION");
         assert_eq!(option_name_to_env("nodeVersion"), "NODEVERSION");
         assert_eq!(option_name_to_env("my-option"), "MY_OPTION");
+    }
+
+    #[test]
+    fn feature_option_defaults_are_merged_into_user_options() {
+        let mut resolved = feature("ghcr.io/devcontainers/features/git:1");
+        resolved.options = serde_json::json!({});
+
+        let mut options = HashMap::new();
+        options.insert(
+            "version".to_string(),
+            FeatureOption {
+                default: Some(serde_json::json!("os-provided")),
+            },
+        );
+        options.insert(
+            "ppa".to_string(),
+            FeatureOption {
+                default: Some(serde_json::json!(true)),
+            },
+        );
+
+        apply_feature_option_defaults(&mut resolved, &options);
+
+        assert_eq!(
+            resolved.options,
+            serde_json::json!({"version": "os-provided", "ppa": true})
+        );
+    }
+
+    #[test]
+    fn feature_option_defaults_do_not_override_user_values() {
+        let mut resolved = feature("ghcr.io/devcontainers/features/git:1");
+        resolved.options = serde_json::json!({"version": "latest"});
+
+        let mut options = HashMap::new();
+        options.insert(
+            "version".to_string(),
+            FeatureOption {
+                default: Some(serde_json::json!("os-provided")),
+            },
+        );
+
+        apply_feature_option_defaults(&mut resolved, &options);
+
+        assert_eq!(resolved.options, serde_json::json!({"version": "latest"}));
     }
 
     #[test]
