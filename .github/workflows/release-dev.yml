@@ -1,0 +1,76 @@
+name: Dev pre-release
+
+# Every push to the dev branch produces a GitHub pre-release tagged
+# v<version>-dev.<short-sha> (e.g. v0.1.12-dev.a1b2c3d) with the built
+# binary attached. The SHA suffix keeps each dev commit's release unique, so
+# re-running or pushing again never collides with an existing tag.
+on:
+  push:
+    branches: [dev]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Creating a release writes a tag + release object, so this workflow needs
+# write access to contents. Everything else stays at the default read.
+permissions:
+  contents: write
+
+# Rapid dev pushes supersede each other: only the newest in-flight run builds
+# and releases. A cancelled run simply means that commit gets no release, which
+# is fine because a newer one supersedes it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-release:
+    name: Build and publish dev pre-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain (stable)
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          rustflags: ""
+          # This action bundles Swatinem/rust-cache; disable it so the explicit
+          # cache step below is the single source of caching.
+          cache: false
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: . -> target
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      # Derive the pre-release tag from Cargo.toml plus the short commit SHA,
+      # e.g. version 0.1.12 at commit abc1234 -> v0.1.12-dev.abc1234.
+      - name: Compute pre-release version
+        id: version
+        run: |
+          base=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          sha=${GITHUB_SHA::7}
+          echo "tag=v${base}-dev.${sha}" >> "$GITHUB_OUTPUT"
+          echo "version=${base}-dev.${sha}" >> "$GITHUB_OUTPUT"
+
+      # Uses the preinstalled gh CLI (no third-party action to pin). The tag is
+      # created at the pushed commit, and --prerelease marks it as a pre-release
+      # so it never shows as the latest stable release.
+      - name: Create GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            target/release/dev \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "dev pre-release ${{ steps.version.outputs.version }}" \
+            --notes "Automated pre-release from the \`dev\` branch (commit ${{ github.sha }})." \
+            --prerelease
