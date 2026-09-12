@@ -34,6 +34,25 @@ cargo check
 
 **Note:** The `apple-container` crate requires macOS to compile. On other platforms, builds will exclude it automatically. CI covers that path in a separate `macos-latest` job that runs `cargo build --features apple` and `cargo test --workspace --features apple`, so if you touch the Apple Containers runtime, run those on a Mac before submitting. `--workspace` is what makes the `apple-container` crate's own tests run — without it cargo tests only the root package. Building with `--features apple` also needs `protoc` on `PATH` (`brew install protobuf`) — the crate's build script generates gRPC bindings with `tonic-build`.
 
+### Runtime e2e tests
+
+`tests/runtime_e2e.rs` drives a full lifecycle against a real daemon: it runs the built `dev` binary through `up`, `status`, `exec`, and `down`, and calls the `ContainerRuntime` trait directly to check that Docker and Podman accept the requests `dev` builds. Those tests are gated on `DEV_E2E_RUNTIME` and skip when it is unset, so a plain `cargo test` stays green on a machine with no runtime.
+
+Run a leg locally with the daemon up:
+
+```sh
+DEV_E2E_RUNTIME=docker cargo test --test runtime_e2e -- --test-threads=1
+DEV_E2E_RUNTIME=podman cargo test --test runtime_e2e -- --test-threads=1
+```
+
+Podman needs its API socket running. Rootless Podman publishes it at `$XDG_RUNTIME_DIR/podman/podman.sock`, which is where `dev` looks first, so start the service before the test:
+
+```sh
+podman system service --time=0 &
+```
+
+CI runs both legs as the `e2e` job in `.github/workflows/rust.yml`, one per runtime.
+
 ## Making Changes
 
 - Keep commits focused — one logical change per commit

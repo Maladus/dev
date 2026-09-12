@@ -113,3 +113,66 @@ jobs:
       # excluded here rather than blocking this gate.
       - name: cargo clippy --features apple
         run: cargo clippy -p devcontainer --features apple --all-targets --no-deps -- -D warnings
+
+  # Live end-to-end tests against a real container daemon, one leg per backend.
+  # Docker is preinstalled on the runner; Podman runs rootless after an apt
+  # install and a user service to publish its API socket. `needs: ci` keeps the
+  # slow, network-dependent legs from starting when the fast gate already
+  # failed, and `fail-fast: false` still reports both backends in one run.
+  e2e:
+    name: e2e (${{ matrix.runtime }})
+    needs: ci
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [docker, podman]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain (stable)
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          rustflags: ""
+          cache: false
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: . -> target
+          key: e2e-${{ matrix.runtime }}
+
+      # Rootless Podman needs a runtime dir it owns and a running API service;
+      # neither is present on a fresh runner. Use a path under $HOME rather than
+      # depending on /run/user/<uid>, and log events to a file because the
+      # runner has no systemd user session for journald. XDG_RUNTIME_DIR is
+      # persisted to later steps so `dev` finds the socket where it probes.
+      - name: Set up Podman
+        if: matrix.runtime == 'podman'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y podman
+          export XDG_RUNTIME_DIR="$HOME/.xdg-runtime"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          mkdir -p "$XDG_RUNTIME_DIR/podman"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          mkdir -p "$HOME/.config/containers"
+          printf '[engine]\nevents_logger = "file"\n' > "$HOME/.config/containers/containers.conf"
+          podman system service --time=0 "unix://$XDG_RUNTIME_DIR/podman/podman.sock" &
+          for _ in $(seq 1 30); do
+            if [ -S "$XDG_RUNTIME_DIR/podman/podman.sock" ]; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Podman API socket did not appear" >&2
+          podman info >&2 || true
+          exit 1
+
+      - name: Run runtime e2e tests
+        env:
+          DEV_E2E_RUNTIME: ${{ matrix.runtime }}
+        run: cargo test --test runtime_e2e -- --test-threads=1
