@@ -1505,7 +1505,8 @@ impl ContainerRuntime for AppleRuntime {
             if let Some(c) = cached {
                 return Ok(ImageMetadata {
                     env: c.env,
-                    container_user: c.user,
+                    container_user: c.user.clone(),
+                    image_user: c.user,
                     ..ImageMetadata::default()
                 });
             }
@@ -1519,7 +1520,8 @@ impl ContainerRuntime for AppleRuntime {
             match fetch_and_cache_oci_config(&image).await {
                 Ok(c) => Ok(ImageMetadata {
                     env: c.env.clone(),
-                    container_user: c.user,
+                    container_user: c.user.clone(),
+                    image_user: c.user,
                     ..ImageMetadata::default()
                 }),
                 Err(_) => Ok(ImageMetadata::default()),

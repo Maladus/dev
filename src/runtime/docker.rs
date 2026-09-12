@@ -1096,6 +1096,15 @@ impl BollardRuntime {
             }
         }
 
+        // The image's own user, independent of any containerUser label, so a
+        // feature build can restore it after running installs as root.
+        let image_user = config
+            .user
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string);
+
         // Fall back to the Dockerfile USER instruction for container_user.
         if container_user.is_none()
             && let Some(ref user) = config.user
@@ -1109,6 +1118,7 @@ impl BollardRuntime {
         Ok(ImageMetadata {
             remote_user,
             container_user,
+            image_user,
             metadata_entries,
             env: Vec::new(),
         })

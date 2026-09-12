@@ -381,10 +381,15 @@ pub(crate) async fn run_with_runtime(
             let staging_dir = stage_feature_context(&ordered)?;
             let feature_user =
                 resolve_remote_user(runtime, &base_image, config.remote_user.as_deref()).await?;
+            let image_user = runtime
+                .inspect_image_metadata(&base_image)
+                .await?
+                .image_user;
             let dockerfile = generate_feature_dockerfile_with_opts(
                 &base_image,
                 &ordered,
                 feature_user.as_deref(),
+                image_user.as_deref(),
                 &config,
             );
             if verbose {
@@ -1339,11 +1344,16 @@ async fn run_compose(
         let staging_dir = stage_feature_context(&ordered)?;
         let feature_user =
             resolve_remote_user(runtime, &base_image, config.remote_user.as_deref()).await?;
+        let image_user = runtime
+            .inspect_image_metadata(&base_image)
+            .await?
+            .image_user;
         let feature_tag = feature_image_tag(&folder_image, config, &ordered);
         let dockerfile = generate_feature_dockerfile_with_opts(
             &base_image,
             &ordered,
             feature_user.as_deref(),
+            image_user.as_deref(),
             config,
         );
         if verbose {
