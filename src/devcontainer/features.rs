@@ -432,7 +432,9 @@ fn apply_feature_option_defaults(
     let mut merged = feature.options.as_object().cloned().unwrap_or_default();
     for (name, opt) in options {
         if let Some(default) = &opt.default {
-            merged.entry(name.clone()).or_insert_with(|| default.clone());
+            merged
+                .entry(name.clone())
+                .or_insert_with(|| default.clone());
         }
     }
     feature.options = serde_json::Value::Object(merged);
