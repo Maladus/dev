@@ -136,10 +136,15 @@ pub async fn run(
             config.remote_user.as_deref(),
         )
         .await?;
+        let image_user = runtime
+            .inspect_image_metadata(&folder_image)
+            .await?
+            .image_user;
         let dockerfile = generate_feature_dockerfile_with_opts(
             &folder_image,
             &ordered,
             feature_user.as_deref(),
+            image_user.as_deref(),
             &config,
         );
         eprintln!("Building features image...");
@@ -255,10 +260,15 @@ pub async fn run(
         let feature_user =
             resolve_remote_user(runtime.as_ref(), &base_image, config.remote_user.as_deref())
                 .await?;
+        let image_user = runtime
+            .inspect_image_metadata(&base_image)
+            .await?
+            .image_user;
         let dockerfile = generate_feature_dockerfile_with_opts(
             &base_image,
             &ordered,
             feature_user.as_deref(),
+            image_user.as_deref(),
             &config,
         );
         eprintln!("Building features image...");
@@ -319,10 +329,15 @@ pub async fn run(
     let staging_dir = stage_feature_context(&ordered)?;
     let feature_user =
         resolve_remote_user(runtime.as_ref(), &base_image, config.remote_user.as_deref()).await?;
+    let image_user = runtime
+        .inspect_image_metadata(&base_image)
+        .await?
+        .image_user;
     let dockerfile = generate_feature_dockerfile_with_opts(
         &base_image,
         &ordered,
         feature_user.as_deref(),
+        image_user.as_deref(),
         &config,
     );
     eprintln!("Building features image...");

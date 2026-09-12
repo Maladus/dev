@@ -3,7 +3,7 @@ use crate::devcontainer::features::ResolvedFeature;
 use crate::error::DevError;
 use crate::runtime::{ContainerRuntime, ExecResult};
 
-/// Execute all lifecycle hooks in the devcontainer spec order.
+/// Execute the container-creation lifecycle hooks in the devcontainer spec order.
 ///
 /// Container lifecycle hooks are workspace-scoped commands: callers pass the
 /// resolved `workspaceFolder` so a reused container with a stale `WorkingDir`
@@ -13,11 +13,12 @@ use crate::runtime::{ContainerRuntime, ExecResult};
 /// 1. onCreateCommand  (feature hooks first, then devcontainer.json)
 /// 2. updateContentCommand
 /// 3. postCreateCommand (feature hooks first, then devcontainer.json)
-/// 4. postStartCommand  (feature hooks first, then devcontainer.json)
 ///
-/// `postAttachCommand` is not run here as it requires an attached session.
-/// Use [`run_post_attach_hooks`] for that.
-pub async fn run_lifecycle_hooks<R: ContainerRuntime + ?Sized>(
+/// postStartCommand runs separately via run_post_start_hooks so dotfiles can be
+/// installed between the two, matching the reference CLI. Neither runs
+/// postAttachCommand, which requires an attached session; use
+/// run_post_attach_hooks for that.
+pub async fn run_create_hooks<R: ContainerRuntime + ?Sized>(
     runtime: &R,
     container_id: &str,
     config: &DevcontainerConfig,
@@ -84,6 +85,24 @@ pub async fn run_lifecycle_hooks<R: ContainerRuntime + ?Sized>(
         )
         .await?;
     }
+
+    Ok(())
+}
+
+/// Execute `postStartCommand` hooks in the devcontainer spec order.
+///
+/// Feature hooks run first, then the config's. This runs on every container
+/// start, after dotfiles are installed on creation.
+pub async fn run_post_start_hooks<R: ContainerRuntime + ?Sized>(
+    runtime: &R,
+    container_id: &str,
+    config: &DevcontainerConfig,
+    user: Option<&str>,
+    workdir: Option<&str>,
+    features: Option<&[ResolvedFeature]>,
+) -> Result<(), DevError> {
+    let empty = Vec::new();
+    let features = features.unwrap_or(&empty);
 
     // postStartCommand: features first, then config
     for f in features {

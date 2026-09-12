@@ -294,6 +294,38 @@ fn docker_credentials_for(image: &str) -> Option<bollard::auth::DockerCredential
     None
 }
 
+/// Write the build context as an uncompressed tar with the Dockerfile injected.
+///
+/// Symlinks are archived as symlinks and never followed, matching `docker
+/// build`: a dangling link inside the context is a valid tar entry, not an
+/// error. `append_dir_all` follows links by default and stats each target,
+/// which fails on the dangling links generated under e.g. `build/`.
+fn write_context_tar<W: std::io::Write>(
+    context: &Path,
+    dockerfile: &str,
+    out: W,
+) -> Result<W, DevError> {
+    let mut archive = tar::Builder::new(out);
+    archive.follow_symlinks(false);
+    archive
+        .append_dir_all(".", context)
+        .map_err(|e| DevError::BuildFailed(format!("Failed to archive context: {e}")))?;
+
+    // Inject the Dockerfile content into the archive so the daemon can find it.
+    let dockerfile_bytes = dockerfile.as_bytes();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(dockerfile_bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, "Dockerfile", dockerfile_bytes)
+        .map_err(|e| DevError::BuildFailed(format!("Failed to add Dockerfile to archive: {e}")))?;
+
+    archive
+        .into_inner()
+        .map_err(|e| DevError::BuildFailed(format!("Failed to finalize archive: {e}")))
+}
+
 impl BollardRuntime {
     /// Connect to a specific socket path.
     pub fn connect_to_socket(socket: &str) -> Result<Self, DevError> {
@@ -355,28 +387,8 @@ impl BollardRuntime {
         use futures_util::StreamExt;
 
         // Create a tar.gz archive of the build context with the Dockerfile injected.
-        let buf = Vec::new();
-        let encoder = GzEncoder::new(buf, Compression::default());
-        let mut archive = tar::Builder::new(encoder);
-        archive
-            .append_dir_all(".", context)
-            .map_err(|e| DevError::BuildFailed(format!("Failed to archive context: {e}")))?;
-
-        // Inject the Dockerfile content into the archive so the daemon can find it.
-        let dockerfile_bytes = dockerfile.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_size(dockerfile_bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        archive
-            .append_data(&mut header, "Dockerfile", dockerfile_bytes)
-            .map_err(|e| {
-                DevError::BuildFailed(format!("Failed to add Dockerfile to archive: {e}"))
-            })?;
-
-        let encoder = archive
-            .into_inner()
-            .map_err(|e| DevError::BuildFailed(format!("Failed to finalize archive: {e}")))?;
+        let encoder = GzEncoder::new(Vec::new(), Compression::default());
+        let encoder = write_context_tar(context, dockerfile, encoder)?;
         let compressed = encoder
             .finish()
             .map_err(|e| DevError::BuildFailed(format!("Failed to compress context: {e}")))?;
@@ -1084,6 +1096,15 @@ impl BollardRuntime {
             }
         }
 
+        // The image's own user, independent of any containerUser label, so a
+        // feature build can restore it after running installs as root.
+        let image_user = config
+            .user
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string);
+
         // Fall back to the Dockerfile USER instruction for container_user.
         if container_user.is_none()
             && let Some(ref user) = config.user
@@ -1097,6 +1118,7 @@ impl BollardRuntime {
         Ok(ImageMetadata {
             remote_user,
             container_user,
+            image_user,
             metadata_entries,
             env: Vec::new(),
         })
@@ -1616,6 +1638,60 @@ mod tests {
             recorded_exit_code(Some(false), None),
             None,
             "a stopped exec whose code is not recorded yet is not a success"
+        );
+    }
+
+    /// A dangling symlink in the build context is a valid tar entry, not an
+    /// error: `docker build` stores it as a link and never stats the target.
+    #[test]
+    fn context_tar_preserves_symlinks_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let links = dir
+            .path()
+            .join("build/zephyr/misc/generated/syscalls_links");
+        std::fs::create_dir_all(&links).unwrap();
+        let dangling = "/workspaces/repo/deps/zephyr/include/zephyr/audio";
+        symlink(dangling, links.join("include_zephyr_audio")).unwrap();
+        std::fs::write(dir.path().join("real.txt"), b"hi").unwrap();
+        symlink("real.txt", dir.path().join("real_link")).unwrap();
+
+        let bytes = write_context_tar(dir.path(), "FROM scratch\n", Vec::new())
+            .expect("a dangling symlink must not fail the archive");
+
+        let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+        let mut links_found = std::collections::HashMap::new();
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            if entry.header().entry_type() == tar::EntryType::Symlink {
+                let name = entry
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .trim_start_matches("./")
+                    .to_string();
+                let target = entry
+                    .link_name()
+                    .unwrap()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                links_found.insert(name, target);
+            }
+        }
+
+        assert_eq!(
+            links_found
+                .get("build/zephyr/misc/generated/syscalls_links/include_zephyr_audio")
+                .map(String::as_str),
+            Some(dangling),
+            "the dangling link must be stored as a symlink with its original target"
+        );
+        assert_eq!(
+            links_found.get("real_link").map(String::as_str),
+            Some("real.txt"),
+            "a link to a real file must stay a link, not a copy"
         );
     }
 }

@@ -616,6 +616,7 @@ fn create_tar(src_dir: &std::path::Path, tar_path: &std::path::Path) -> Result<(
     use std::fs::File;
     let file = File::create(tar_path)?;
     let mut builder = tar::Builder::new(file);
+    builder.follow_symlinks(false);
     // Append contents of the directory, preserving relative paths.
     for entry in std::fs::read_dir(src_dir)? {
         let entry = entry?;
@@ -734,13 +735,18 @@ pub fn generate_feature_dockerfile_with_opts(
     base_image: &str,
     features: &[ResolvedFeature],
     remote_user: Option<&str>,
+    image_user: Option<&str>,
     config: &DevcontainerConfig,
 ) -> String {
     let user = remote_user.unwrap_or("root");
+    let restore_user = image_user.unwrap_or("root");
 
     let mut lines: Vec<String> = Vec::new();
 
     lines.push(format!("FROM {base_image}"));
+    // Feature install scripts expect to run as root; the base image's user is
+    // restored before the metadata label so the final image keeps it.
+    lines.push("USER root".to_string());
 
     // Set _REMOTE_USER / _CONTAINER_USER immediately so later RUN steps can reference them.
     lines.push(format!("ENV _REMOTE_USER=\"{user}\""));
@@ -823,6 +829,9 @@ pub fn generate_feature_dockerfile_with_opts(
                 feature_wrapper_script(&feature.id, &feature.version, &stage_dir, &option_exports),
         ));
     }
+
+    // Restore the image's user after the root-only install steps.
+    lines.push(format!("USER {restore_user}"));
 
     // Build and emit the devcontainer.metadata label (Gap 4).
     let metadata_label = build_metadata_label(features, config, remote_user);
@@ -1211,8 +1220,13 @@ mod tests {
             make_feature("feature-b", serde_json::json!({})),
         ];
         let config = empty_config();
-        let dockerfile =
-            generate_feature_dockerfile_with_opts("base:latest", &features, Some("root"), &config);
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            "base:latest",
+            &features,
+            Some("root"),
+            Some("root"),
+            &config,
+        );
 
         // Feature options should be in RUN (scoped), not ENV (global).
         assert!(
@@ -1235,8 +1249,13 @@ mod tests {
             .insert("MY_VAR".to_string(), "hello".to_string());
         let features = vec![feature];
         let config = empty_config();
-        let dockerfile =
-            generate_feature_dockerfile_with_opts("base:latest", &features, Some("root"), &config);
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            "base:latest",
+            &features,
+            Some("root"),
+            Some("root"),
+            &config,
+        );
         assert!(
             dockerfile.contains("ENV MY_VAR=\"hello\""),
             "containerEnv should use ENV directives.\nDockerfile:\n{dockerfile}"
@@ -1302,8 +1321,13 @@ mod tests {
             serde_json::json!({"desc": "line1\nline2"}),
         )];
         let config = empty_config();
-        let dockerfile =
-            generate_feature_dockerfile_with_opts("base:latest", &features, Some("root"), &config);
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            "base:latest",
+            &features,
+            Some("root"),
+            Some("root"),
+            &config,
+        );
         // Newlines should be escaped as \n inside printf, not literal newlines
         // that would break the Dockerfile RUN instruction.
         assert!(
@@ -1313,6 +1337,79 @@ mod tests {
         assert!(
             dockerfile.contains("export DESC=\"$(printf '%b' 'line1\\nline2')\""),
             "Special characters should be escaped via printf.\nDockerfile:\n{dockerfile}"
+        );
+    }
+
+    /// A dangling symlink in a feature artifact is a valid tar entry; the
+    /// feature context must not stat its target either.
+    #[test]
+    fn create_tar_preserves_dangling_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("feature");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("install.sh"), b"#!/bin/sh\n").unwrap();
+        symlink("../../missing/audio", src.join("include_zephyr_audio")).unwrap();
+
+        let tar_path = dir.path().join("feature.tar");
+        create_tar(&src, &tar_path).expect("a dangling symlink must not fail the tar");
+
+        let file = std::fs::File::open(&tar_path).unwrap();
+        let mut archive = tar::Archive::new(file);
+        let mut target = None;
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().unwrap() == std::path::Path::new("include_zephyr_audio") {
+                assert_eq!(entry.header().entry_type(), tar::EntryType::Symlink);
+                target = Some(
+                    entry
+                        .link_name()
+                        .unwrap()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        assert_eq!(target.as_deref(), Some("../../missing/audio"));
+    }
+
+    /// Feature install steps must run as root (the base image's `USER` would
+    /// otherwise apply) and the base image's user must be restored afterwards.
+    #[test]
+    fn feature_install_runs_as_root_then_restores_image_user() {
+        let features = vec![make_feature("feature-a", serde_json::json!({}))];
+        let config = empty_config();
+        let dockerfile = generate_feature_dockerfile_with_opts(
+            "base:latest",
+            &features,
+            Some("vscode"),
+            Some("vscode"),
+            &config,
+        );
+
+        let lines: Vec<&str> = dockerfile.lines().collect();
+        let first_run = lines
+            .iter()
+            .position(|l| l.starts_with("RUN "))
+            .expect("the getent RUN step must be present");
+        let root = lines
+            .iter()
+            .position(|l| *l == "USER root")
+            .expect("USER root must be emitted");
+        let restore = lines
+            .iter()
+            .rposition(|l| *l == "USER vscode")
+            .expect("the image user must be restored");
+
+        assert!(
+            root < first_run,
+            "USER root must precede every feature RUN step.\nDockerfile:\n{dockerfile}"
+        );
+        assert!(
+            restore > first_run,
+            "the image user must be restored after the install steps.\nDockerfile:\n{dockerfile}"
         );
     }
 }

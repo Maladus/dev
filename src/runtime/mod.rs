@@ -161,6 +161,10 @@ pub struct ExecResult {
 pub struct ImageMetadata {
     pub remote_user: Option<String>,
     pub container_user: Option<String>,
+    /// The image's configured user (`Config.User` / OCI `config.User`), independent
+    /// of any `containerUser` metadata label. A feature build restores this after
+    /// running its install scripts as root.
+    pub image_user: Option<String>,
     /// Raw `devcontainer.metadata` label entries, in label order. Empty when the label
     /// is absent or unparseable. Retained so callers can recover settings contributed by
     /// the features that built an image without re-resolving those features.
