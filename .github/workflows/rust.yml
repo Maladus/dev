@@ -3,8 +3,11 @@ name: Rust CI
 on:
   push:
     branches: [main]
+  # `dev` is the integration branch feature PRs target, so the gate has to run
+  # there too. `main` stays listed so the eventual dev-to-main PR is gated the
+  # same way.
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 env:
   CARGO_TERM_COLOR: always
