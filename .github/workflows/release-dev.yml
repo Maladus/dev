@@ -1,9 +1,12 @@
 name: Dev pre-release
 
 # Every push to the dev branch produces a GitHub pre-release tagged
-# v<version>-dev.<short-sha> (e.g. v0.1.12-dev.a1b2c3d) with the built
-# binary attached. The SHA suffix keeps each dev commit's release unique, so
-# re-running or pushing again never collides with an existing tag.
+# v<version>-dev.t<utc-timestamp>.<short-sha> (e.g.
+# v0.1.12-dev.t20260912142855.a1b2c3d) with the built binary attached. The
+# timestamp makes the semver pre-release monotonic, so `mise`/`ubi` `latest`
+# resolves to the newest pre-release instead of the lexically-largest SHA; the
+# SHA keeps the tag traceable and unique, so re-running or pushing again never
+# collides with an existing tag.
 on:
   push:
     branches: [dev]
@@ -51,15 +54,19 @@ jobs:
       - name: cargo build --release
         run: cargo build --release
 
-      # Derive the pre-release tag from Cargo.toml plus the short commit SHA,
-      # e.g. version 0.1.12 at commit abc1234 -> v0.1.12-dev.abc1234.
+      # Derive the pre-release tag from Cargo.toml, a UTC timestamp, and the
+      # short commit SHA, e.g. version 0.1.12 at 2026-09-12T14:28:55Z ->
+      # v0.1.12-dev.t20260912142855.960be93. The leading `t` keeps the
+      # timestamp an alphanumeric semver identifier, which sorts above the
+      # all-SHA identifiers older releases used and orders newest-first.
       - name: Compute pre-release version
         id: version
         run: |
           base=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
           sha=${GITHUB_SHA::7}
-          echo "tag=v${base}-dev.${sha}" >> "$GITHUB_OUTPUT"
-          echo "version=${base}-dev.${sha}" >> "$GITHUB_OUTPUT"
+          stamp=$(date -u +%Y%m%d%H%M%S)
+          echo "tag=v${base}-dev.t${stamp}.${sha}" >> "$GITHUB_OUTPUT"
+          echo "version=${base}-dev.t${stamp}.${sha}" >> "$GITHUB_OUTPUT"
 
       # Uses the preinstalled gh CLI (no third-party action to pin). The tag is
       # created at the pushed commit, and --prerelease marks it as a pre-release
