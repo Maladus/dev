@@ -14,7 +14,7 @@ use crate::devcontainer::features::{
 use crate::devcontainer::uid;
 use crate::devcontainer::{
     DevcontainerConfig, Recipe, download_features, merge_feature_capabilities, resolve_features,
-    run_lifecycle_hooks, stage_feature_context, substitute_variables,
+    run_create_hooks, run_post_start_hooks, stage_feature_context, substitute_variables,
     substitute_variables_with_user,
 };
 use crate::runtime::{
@@ -228,7 +228,7 @@ pub(crate) async fn run_with_runtime(
                 )
                 .await?;
                 if config.post_start_command.is_some() {
-                    run_lifecycle_hooks(
+                    run_post_start_hooks(
                         runtime,
                         &container.id,
                         &config,
@@ -558,13 +558,13 @@ pub(crate) async fn run_with_runtime(
     )
     .await?;
 
-    // Run lifecycle hooks — feature hooks first, then config hooks (Gap 6).
+    // Run creation lifecycle hooks — feature hooks first, then config hooks (Gap 6).
     let feature_hooks = if ordered_features.is_empty() {
         None
     } else {
         Some(ordered_features.as_slice())
     };
-    run_lifecycle_hooks(
+    run_create_hooks(
         runtime,
         &container_id,
         &config,
@@ -574,10 +574,22 @@ pub(crate) async fn run_with_runtime(
     )
     .await?;
 
-    // Clone dotfiles if configured (Gap 15).
+    // Clone dotfiles if configured (Gap 15). The reference CLI installs these
+    // after postCreateCommand and before postStartCommand, so a failing
+    // postStartCommand does not leave the container without dotfiles.
     if let Some(ref dotfiles) = config.dotfiles {
         install_dotfiles(runtime, &container_id, dotfiles, remote_user).await?;
     }
+
+    run_post_start_hooks(
+        runtime,
+        &container_id,
+        &config,
+        remote_user,
+        Some(&workspace_folder),
+        feature_hooks,
+    )
+    .await?;
 
     println!("Container '{name}' is ready.");
 
@@ -1200,7 +1212,12 @@ async fn install_dotfiles(
     if let Some(ref install_cmd) = dotfiles.install_command {
         eprintln!("Running dotfiles install command: {install_cmd}");
         let args = vec!["sh".to_string(), "-c".to_string(), install_cmd.clone()];
-        let result = runtime.exec(container_id, &args, user, None).await?;
+        // The reference CLI runs the install command from inside the checkout
+        // (`cd $targetPath`), so scripts that read a config in the repository
+        // (chezmoi, mise) see it instead of the workspace.
+        let result = runtime
+            .exec(container_id, &args, user, Some(target.as_str()))
+            .await?;
         if result.exit_code != 0 {
             eprintln!(
                 "Warning: dotfiles install command failed (exit {}):\n{}",
@@ -1527,13 +1544,13 @@ async fn run_compose(
     //     lifecycle hooks or success reporting can race ahead of Compose.
     verify_compose_service_ready(runtime, workspace, service, &container_id, remote_user).await?;
 
-    // 13. Run lifecycle hooks with feature hooks and correct remote_user.
+    // 13. Run creation lifecycle hooks with feature hooks and correct remote_user.
     let feature_hooks = if ordered_features.is_empty() {
         None
     } else {
         Some(ordered_features.as_slice())
     };
-    run_lifecycle_hooks(
+    run_create_hooks(
         runtime,
         &container_id,
         config,
@@ -1543,10 +1560,20 @@ async fn run_compose(
     )
     .await?;
 
-    // 14. Install dotfiles.
+    // 14. Install dotfiles before postStartCommand, matching the reference CLI.
     if let Some(ref dotfiles) = config.dotfiles {
         install_dotfiles(runtime, &container_id, dotfiles, remote_user).await?;
     }
+
+    run_post_start_hooks(
+        runtime,
+        &container_id,
+        config,
+        remote_user,
+        None,
+        feature_hooks,
+    )
+    .await?;
 
     // Cleanup temp files.
     let _ = std::fs::remove_file(&override_path);
@@ -4133,7 +4160,7 @@ mod tests {
         super::verify_compose_service_ready(&rt, workspace.path(), "app", "fake-id", None)
             .await
             .expect("readiness should wait for the target service to become usable");
-        crate::devcontainer::run_lifecycle_hooks(&rt, "fake-id", &config, None, None, None)
+        crate::devcontainer::run_post_start_hooks(&rt, "fake-id", &config, None, None, None)
             .await
             .expect("lifecycle hook should run after readiness");
 
@@ -4147,6 +4174,85 @@ mod tests {
             execs.last().map(|(cmd, _, _)| cmd.join(" ")),
             Some("sh -c touch ready".to_string()),
             "the lifecycle hook must not race ahead of the successful readiness probe"
+        );
+    }
+
+    /// Creation hooks must stop before postStartCommand. dev up installs
+    /// dotfiles between the two, matching the reference CLI, so a failing
+    /// postStartCommand cannot leave the container without dotfiles.
+    #[tokio::test]
+    async fn create_hooks_stop_before_post_start() {
+        let config: DevcontainerConfig = serde_json::from_str(
+            r#"{"image":"alpine","onCreateCommand":"touch on","postCreateCommand":"touch post","postStartCommand":"touch start"}"#,
+        )
+        .unwrap();
+        let rt = UpFakeRuntime::ok();
+
+        super::run_create_hooks(&rt, "fake-id", &config, None, None, None)
+            .await
+            .expect("creation hooks should run");
+        let after_create: Vec<String> = rt
+            .execs()
+            .into_iter()
+            .map(|(cmd, _, _)| cmd.join(" "))
+            .collect();
+        assert_eq!(
+            after_create,
+            vec!["sh -c touch on".to_string(), "sh -c touch post".to_string()],
+            "run_create_hooks must run onCreate and postCreate but not postStart"
+        );
+
+        super::run_post_start_hooks(&rt, "fake-id", &config, None, None, None)
+            .await
+            .expect("postStart should run separately");
+        let all: Vec<String> = rt
+            .execs()
+            .into_iter()
+            .map(|(cmd, _, _)| cmd.join(" "))
+            .collect();
+        assert_eq!(
+            all,
+            vec![
+                "sh -c touch on".to_string(),
+                "sh -c touch post".to_string(),
+                "sh -c touch start".to_string(),
+            ],
+            "run_post_start_hooks must run postStart after the creation hooks"
+        );
+    }
+
+    /// The dotfiles install command must run from inside the checkout, matching
+    /// the reference CLI (cd $targetPath). Scripts that read a config file in
+    /// the repository (chezmoi, mise) otherwise resolve the workspace instead.
+    #[tokio::test]
+    async fn dotfiles_install_command_runs_from_the_checkout() {
+        let rt = UpFakeRuntime::ok();
+        let dotfiles = crate::devcontainer::config::DotfilesConfig {
+            repository: "git@example.com:me/dotfiles.git".to_string(),
+            install_command: Some("bash ~/dotfiles/install.sh".to_string()),
+            target_path: Some("~/dotfiles".to_string()),
+        };
+
+        super::install_dotfiles(&rt, "fake-id", &dotfiles, Some("vscode"))
+            .await
+            .expect("dotfiles install should not fail on a successful exec");
+
+        let execs = rt.execs();
+        assert_eq!(execs.len(), 2, "one clone, one install: {execs:?}");
+        assert!(
+            execs[0].0.join(" ").contains("git clone"),
+            "first exec should clone: {:?}",
+            execs[0].0
+        );
+        assert_eq!(
+            execs[1].0.join(" "),
+            "sh -c bash ~/dotfiles/install.sh",
+            "second exec should be the install command"
+        );
+        assert_eq!(
+            execs[1].2.as_deref(),
+            Some("/home/vscode/dotfiles"),
+            "the install command must run from inside the dotfiles checkout"
         );
     }
 
