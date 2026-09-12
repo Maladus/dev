@@ -616,6 +616,7 @@ fn create_tar(src_dir: &std::path::Path, tar_path: &std::path::Path) -> Result<(
     use std::fs::File;
     let file = File::create(tar_path)?;
     let mut builder = tar::Builder::new(file);
+    builder.follow_symlinks(false);
     // Append contents of the directory, preserving relative paths.
     for entry in std::fs::read_dir(src_dir)? {
         let entry = entry?;
@@ -1314,5 +1315,40 @@ mod tests {
             dockerfile.contains("export DESC=\"$(printf '%b' 'line1\\nline2')\""),
             "Special characters should be escaped via printf.\nDockerfile:\n{dockerfile}"
         );
+    }
+
+    /// A dangling symlink in a feature artifact is a valid tar entry; the
+    /// feature context must not stat its target either.
+    #[test]
+    fn create_tar_preserves_dangling_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("feature");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("install.sh"), b"#!/bin/sh\n").unwrap();
+        symlink("../../missing/audio", src.join("include_zephyr_audio")).unwrap();
+
+        let tar_path = dir.path().join("feature.tar");
+        create_tar(&src, &tar_path).expect("a dangling symlink must not fail the tar");
+
+        let file = std::fs::File::open(&tar_path).unwrap();
+        let mut archive = tar::Archive::new(file);
+        let mut target = None;
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().unwrap() == std::path::Path::new("include_zephyr_audio") {
+                assert_eq!(entry.header().entry_type(), tar::EntryType::Symlink);
+                target = Some(
+                    entry
+                        .link_name()
+                        .unwrap()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+        assert_eq!(target.as_deref(), Some("../../missing/audio"));
     }
 }
