@@ -178,4 +178,6 @@ jobs:
       - name: Run runtime e2e tests
         env:
           DEV_E2E_RUNTIME: ${{ matrix.runtime }}
-        run: cargo test --test runtime_e2e -- --test-threads=1
+        # `--nocapture` surfaces the shell enter+exit timing the test prints;
+        # without it the number is swallowed for a passing test.
+        run: cargo test --test runtime_e2e -- --test-threads=1 --nocapture

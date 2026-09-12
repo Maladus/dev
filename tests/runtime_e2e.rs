@@ -20,6 +20,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use devcontainer::runtime::docker::DockerRuntime;
 use devcontainer::runtime::podman::PodmanRuntime;
@@ -67,6 +68,15 @@ fn connect(runtime: &str) -> Box<dyn ContainerRuntime> {
     }
 }
 
+/// The `dev` binary under test.
+///
+/// `DEV_E2E_BIN` overrides the freshly built binary, so the suite can be pointed
+/// at an older build to confirm a test reproduces the bug it was written for
+/// (for example the pre-fix `dev shell` that hung on exit).
+fn dev_binary() -> std::ffi::OsString {
+    std::env::var_os("DEV_E2E_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_dev").into())
+}
+
 /// A workspace with a minimal image-based devcontainer config, plus an isolated
 /// `HOME` so the child never reads the host's `~/.dev` base config.
 struct E2e {
@@ -94,7 +104,7 @@ impl E2e {
     }
 
     fn dev(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_dev"))
+        Command::new(dev_binary())
             .arg("--workspace")
             .arg(self.workspace.path())
             .arg("--runtime")
@@ -302,4 +312,136 @@ async fn podman_accepts_keep_id_userns() {
     rt.start_container(&id).await.expect("start_container");
     rt.stop_container(&id).await.expect("stop_container");
     rt.remove_container(&id).await.expect("remove_container");
+}
+
+/// Time a full `dev shell` enter-then-exit, driving the interactive session
+/// through a pseudo-terminal.
+///
+/// `dev shell` refuses to run without a terminal: it puts stdin into raw mode
+/// before attaching, so a pipe would fail before the shell ever starts. A PTY
+/// gives the child a real terminal, and queueing `exit` on the master before
+/// the shell is ready is safe because the pty buffers input until something
+/// reads it. Returns `None` if the child never exits within `limit`, which is
+/// the regression this test exists to catch.
+#[cfg(unix)]
+fn time_shell_round_trip(e2e: &E2e, limit: Duration) -> Option<Duration> {
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let opened = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(
+        opened,
+        0,
+        "openpty failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    // Hand the child the slave as its three standard streams. `from_raw_fd`
+    // takes ownership, so the parent's copies close when the command spawns and
+    // the master sees EOF once the child exits.
+    let stdin = unsafe { std::fs::File::from_raw_fd(libc::dup(slave)) };
+    let stdout = unsafe { std::fs::File::from_raw_fd(libc::dup(slave)) };
+    let stderr = unsafe { std::fs::File::from_raw_fd(slave) };
+
+    let mut cmd = Command::new(dev_binary());
+    cmd.arg("--workspace")
+        .arg(e2e.workspace.path())
+        .arg("--runtime")
+        .arg(e2e.runtime)
+        .arg("shell")
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .env("HOME", e2e.home.path())
+        .env("DEV_FORCE_TTY", "0");
+    unsafe {
+        cmd.pre_exec(|| {
+            // A new session makes the pty the child's controlling terminal, so
+            // the shell sees a foreground terminal rather than a stray fd.
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let start = Instant::now();
+    let mut child = cmd.spawn().expect("spawn dev shell");
+
+    let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+    let mut writer = master.try_clone().expect("clone pty master");
+    writer.write_all(b"exit\n").expect("queue exit");
+    writer.flush().ok();
+
+    // Non-blocking reads let the loop watchdog the child instead of parking in
+    // a read that a wedged shell would never end (issue #32).
+    let fd = master.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+
+    let mut sink = [0u8; 4096];
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        if start.elapsed() > limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pollfd, 1, 100) } > 0 {
+            let n = unsafe { libc::read(fd, sink.as_mut_ptr() as *mut libc::c_void, sink.len()) };
+            if n == 0 {
+                break;
+            }
+        }
+    }
+    let _ = child.wait();
+    // Drain whatever the shell printed so the pty is quiet before it drops.
+    let mut rest = [0u8; 4096];
+    while matches!(Read::read(&mut master, &mut rest), Ok(n) if n > 0) {}
+    Some(start.elapsed())
+}
+
+/// `dev shell` used to hang on exit (issue #6, #32). Measure the whole
+/// enter-then-exit and fail if it does not return, so the fix cannot silently
+/// regress. The printed duration is the number to watch, not the assertion:
+/// the bound only has to be loose enough to tolerate a loaded runner.
+#[test]
+fn shell_enter_and_exit_completes_promptly() {
+    let runtime = require_runtime!();
+    let e2e = E2e::new(runtime);
+    let _cleanup = Cleanup(&e2e);
+
+    let _ = e2e.dev(&["down", "--remove"]);
+    let up = e2e.dev(&["up"]);
+    assert_success(&up, "dev up");
+
+    let elapsed = time_shell_round_trip(&e2e, Duration::from_secs(60))
+        .expect("dev shell must exit after `exit` instead of hanging");
+    eprintln!("dev shell enter+exit took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "dev shell enter+exit took {elapsed:?}, which points at the exit hang"
+    );
 }
