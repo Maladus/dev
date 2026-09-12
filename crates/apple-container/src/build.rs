@@ -2508,6 +2508,24 @@ mod tests {
         }
     }
 
+    /// A sink that still gives up on a stalled send, but with a budget the
+    /// walk's producer half cannot beat on a loaded machine.
+    ///
+    /// [`stream_walk_archive`] bounds both its waits with the sink's budget,
+    /// including the wait for the first archive chunk. That chunk crosses the
+    /// blocking pool after a filesystem read, and on a cold runner it can exceed
+    /// the 50ms [`impatient_sink`] uses, so the test reports the producer stall
+    /// instead of the sink stall it is about. A longer shared budget keeps the
+    /// send path deterministic: the sink is never drained, so its send still
+    /// ends on the deadline, while a first chunk that is merely slow no longer
+    /// wins the race.
+    fn walk_stall_sink(packets: &tokio::sync::mpsc::Sender<ClientStream>) -> BuilderSink {
+        BuilderSink {
+            packets: packets.clone(),
+            idle: std::time::Duration::from_secs(2),
+        }
+    }
+
     /// Await something that must bound itself, failing rather than hanging if
     /// it does not.
     ///
@@ -2953,7 +2971,7 @@ mod tests {
             must_bound_itself(stream_walk_archive(
                 entries,
                 &"0".repeat(64),
-                &impatient_sink(&tx),
+                &walk_stall_sink(&tx),
                 REPLY_ID,
                 &request,
             ))
