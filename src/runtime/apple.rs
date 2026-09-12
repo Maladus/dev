@@ -2669,6 +2669,7 @@ mod tests {
             userns_mode: None,
             devices: vec![],
             group_add: vec![],
+            device_cgroup_rules: vec![],
         }
     }
 
@@ -2794,6 +2795,7 @@ mod tests {
             userns_mode: None,
             devices: vec![],
             group_add: vec![],
+            device_cgroup_rules: vec![],
         };
 
         let image = ImageDescription::default();
@@ -3042,6 +3044,7 @@ mod tests {
             userns_mode: None,
             devices: vec![],
             group_add: vec![],
+            device_cgroup_rules: vec![],
         };
 
         // Clean up any previous test container (using truncated ID)

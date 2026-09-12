@@ -332,11 +332,9 @@ impl BollardRuntime {
         // matches: None makes bollard send an empty X-Registry-Auth value that
         // Podman rejects as invalid JSON.
         let credentials = docker_credentials_for(image).unwrap_or_default();
-        let mut stream = self.client.create_image(
-            Some(opts),
-            None,
-            Some(credentials),
-        );
+        let mut stream = self
+            .client
+            .create_image(Some(opts), None, Some(credentials));
         while let Some(result) = stream.next().await {
             result?;
         }
