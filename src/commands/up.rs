@@ -488,7 +488,13 @@ pub(crate) async fn run_with_runtime(
         workspace,
         remote_user,
     );
-    let mounts = parse_mounts(&mount_strings);
+    let workspace_target = config.workspace_mount_target(workspace, remote_user)?;
+    let mut mounts = parse_mounts(&mount_strings);
+    let git_safe_dirs = git_safe_directories(
+        workspace,
+        &workspace_target,
+        &add_worktree_mounts(&mut mounts, workspace, &workspace_target),
+    );
 
     let volume_strings: Vec<String> = config
         .volumes
@@ -522,7 +528,7 @@ pub(crate) async fn run_with_runtime(
         ports,
         workspace_mount: Some(WorkspaceMount {
             source: workspace.to_path_buf(),
-            target: config.workspace_mount_target(workspace, remote_user)?,
+            target: workspace_target,
         }),
         workspace_folder: Some(workspace_folder.clone()),
         extra_args: vec![],
@@ -557,6 +563,7 @@ pub(crate) async fn run_with_runtime(
         Some(&workspace_folder),
     )
     .await?;
+    mark_git_safe_directories(runtime, &container_id, &git_safe_dirs, remote_user).await;
 
     // Run creation lifecycle hooks — feature hooks first, then config hooks (Gap 6).
     let feature_hooks = if ordered_features.is_empty() {
@@ -1681,6 +1688,86 @@ fn substitute_mounts(
     out
 }
 
+/// Append the mounts a linked git worktree needs for in-container git, unless
+/// the config already mounts something at the same target. Returns the added
+/// mounts.
+fn add_worktree_mounts(
+    mounts: &mut Vec<BindMount>,
+    workspace: &Path,
+    workspace_target: &str,
+) -> Vec<BindMount> {
+    let mut added = Vec::new();
+    for m in crate::devcontainer::worktree::worktree_mounts(workspace, workspace_target) {
+        if mounts.iter().any(|e| e.target == m.target) {
+            continue;
+        }
+        eprintln!(
+            "Linked git worktree: mounting {} at {}",
+            m.source.display(),
+            m.target
+        );
+        mounts.push(m.clone());
+        added.push(m);
+    }
+    added
+}
+
+/// Container paths where the workspace's git checkout is visible. Empty when
+/// the workspace is not a git checkout.
+fn git_safe_directories(
+    workspace: &Path,
+    workspace_target: &str,
+    worktree_mounts: &[BindMount],
+) -> Vec<String> {
+    if !workspace.join(".git").exists() {
+        return Vec::new();
+    }
+    let mut dirs = vec![workspace_target.to_string()];
+    dirs.extend(
+        worktree_mounts
+            .iter()
+            .filter(|m| m.source == workspace)
+            .map(|m| m.target.clone()),
+    );
+    dirs
+}
+
+/// Mark the workspace as a git `safe.directory` for the remote user, as VS Code
+/// Dev Containers does. The bind-mounted files keep the host owner, so without
+/// it git refuses the repository ("dubious ownership") whenever the container
+/// user's uid differs from the host's, e.g. a root container. Best effort: a
+/// missing git or a failing command only warns.
+async fn mark_git_safe_directories(
+    runtime: &dyn ContainerRuntime,
+    container_id: &str,
+    dirs: &[String],
+    user: Option<&str>,
+) {
+    const SCRIPT: &str = r#"command -v git >/dev/null 2>&1 || exit 0
+for d in "$@"; do
+  git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$d" \
+    || git config --global --add safe.directory "$d" || exit 1
+done"#;
+    if dirs.is_empty() {
+        return;
+    }
+    let mut args = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        SCRIPT.to_string(),
+        "sh".to_string(),
+    ];
+    args.extend(dirs.iter().cloned());
+    match runtime.exec(container_id, &args, user, None).await {
+        Ok(r) if r.exit_code == 0 => {}
+        Ok(r) => eprintln!(
+            "Warning: could not mark the workspace as a git safe.directory (exit {}):\n{}",
+            r.exit_code, r.stderr
+        ),
+        Err(e) => eprintln!("Warning: could not mark the workspace as a git safe.directory: {e}"),
+    }
+}
+
 /// Parse mount strings from devcontainer.json into `BindMount` structs.
 ///
 /// Supports two formats:
@@ -1808,14 +1895,15 @@ fn parse_volumes(volume_strings: &[String]) -> Vec<VolumeMount> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONFIG_HASH_LABEL, apply_cli_overrides, apply_run_args_capabilities, ensure_image_present,
-        parse_mounts, parse_single_mount, project_declares_run_args,
-        reject_project_run_args_for_compose, substitute_mounts,
+        CONFIG_HASH_LABEL, add_worktree_mounts, apply_cli_overrides, apply_run_args_capabilities,
+        ensure_image_present, git_safe_directories, parse_mounts, parse_single_mount,
+        project_declares_run_args, reject_project_run_args_for_compose, substitute_mounts,
     };
     use crate::devcontainer::config::{DevcontainerConfig, MountObject, MountSpec};
     use crate::devcontainer::effective::load_effective_config_value;
     use crate::devcontainer::features::MergedCapabilities;
     use crate::error::DevError;
+    use crate::runtime::BindMount;
     use crate::runtime::{
         AttachedExec, BoxFut, ContainerConfig, ContainerInfo, ContainerRuntime, ContainerState,
         ExecResult, ImageMetadata,
@@ -1825,6 +1913,64 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    /// A linked worktree whose main repo sits next to it, absolute pointers.
+    fn linked_worktree(tmp: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = tmp.path().canonicalize().unwrap();
+        let main_git = root.join("repo/.git");
+        let admin = main_git.join("worktrees/feat");
+        let worktree = root.join("repo__worktrees/feat");
+        fs::create_dir_all(&admin).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+        (main_git, worktree)
+    }
+
+    #[test]
+    fn worktree_mounts_do_not_override_a_configured_mount() {
+        let tmp = TempDir::new().unwrap();
+        let (main_git, worktree) = linked_worktree(&tmp);
+        let mut mounts = vec![BindMount {
+            source: "/elsewhere".into(),
+            target: main_git.to_string_lossy().into_owned(),
+            readonly: true,
+        }];
+        let added = add_worktree_mounts(&mut mounts, &worktree, "/workspace");
+        assert_eq!(added.len(), 1, "only the workspace re-mount is new");
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(mounts[0].source, Path::new("/elsewhere"));
+    }
+
+    #[test]
+    fn git_safe_directories_cover_every_workspace_mount() {
+        let tmp = TempDir::new().unwrap();
+        let (_, worktree) = linked_worktree(&tmp);
+        let mut mounts = Vec::new();
+        let added = add_worktree_mounts(&mut mounts, &worktree, "/workspace");
+        assert_eq!(
+            git_safe_directories(&worktree, "/workspace", &added),
+            vec![
+                "/workspace".to_string(),
+                worktree.to_string_lossy().into_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn git_safe_directories_empty_outside_git() {
+        let tmp = TempDir::new().unwrap();
+        assert!(git_safe_directories(tmp.path(), "/workspace", &[]).is_empty());
+    }
 
     /// Serializes tests that set `DEV_FORCE_TTY`/`DEV_REBUILD_ANSWER`, since
     /// process-global env vars would otherwise race across parallel tests.
