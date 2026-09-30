@@ -11,6 +11,7 @@ pub mod run_args;
 pub mod templates;
 pub mod uid;
 pub mod variables;
+pub mod worktree;
 
 pub use config::DevcontainerConfig;
 pub use features::{

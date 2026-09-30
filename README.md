@@ -89,6 +89,12 @@ When the effective config has changed since the container was built, `dev up` de
 
 `--update-remote-user-uid-default` (`on` by default, also accepted by `dev build`) sets the fallback for `updateRemoteUserUID` when the config doesn't declare it: on Linux, `on` rebuilds the image with the `remoteUser`'s UID/GID remapped to yours so bind-mounted files stay writable. `never` disables the remap even when the config asks for it. It is a no-op on macOS, and when `remoteUser` is `root` or a numeric UID.
 
+### Git inside the container
+
+When the workspace is a git checkout, `dev up` marks it as a git `safe.directory` for the remote user (as VS Code Dev Containers does), so git does not refuse the bind-mounted repository with "dubious ownership" when the container user's UID differs from yours, e.g. in a root container.
+
+When the workspace is a linked worktree (`git worktree add`), its `.git` is a file pointing into the main repository's `.git`, which is outside the workspace and so not in the container. `dev up` then also bind-mounts that shared git directory wherever the pointer resolves inside the container, and mounts the workspace a second time where the main repository's back-pointer expects it, so `git worktree prune` run in the container does not treat the worktree as deleted. The paths are derived from the host at `dev up` time; nothing user-specific goes into `devcontainer.json`. Absolute pointers (git's default) and `--relative-paths` worktrees are both handled, and a mount the config already declares at the same target wins. The mounts only apply when the container is created: recreate an existing container (`dev down --remove`, then `dev up`) to pick them up. The Compose path does not add them.
+
 Once the container is ready, the terminal-first entry points all attach to that same running container:
 
 ```sh
