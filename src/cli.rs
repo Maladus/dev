@@ -111,6 +111,11 @@ pub enum Command {
         #[arg(short = 'u', long)]
         user: Option<String>,
 
+        /// Attach the caller's terminal instead of capturing output. Use for
+        /// interactive commands such as an agent CLI or a debugger.
+        #[arg(short = 'i', long)]
+        interactive: bool,
+
         /// Command to run
         #[arg(required = true)]
         cmd: Vec<String>,

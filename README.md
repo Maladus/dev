@@ -44,9 +44,15 @@ To run a one-off command instead of an interactive shell:
 ```sh
 dev exec -- cargo test
 dev exec -u root -- apt-get update
+dev exec -i -- pi            # interactive: attaches your terminal
 ```
 
-This is the shape an AI coding agent uses: `dev up` once, then `dev shell` (or `dev exec -- <agent command>`) to do its work inside the container. No editor is running.
+`dev exec` captures output and returns when the command finishes, which suits
+one-off commands. Pass `-i`/`--interactive` for anything that owns the terminal
+- an agent CLI, a debugger, a TUI - so stdin and a TTY are attached and output
+streams live instead of being printed at the end.
+
+This is the shape an AI coding agent uses: `dev up` once, then `dev shell` (or `dev exec -i -- <agent command>`) to do its work inside the container. No editor is running.
 
 If you have no `.devcontainer/` yet, scaffold one:
 
@@ -476,7 +482,7 @@ dev up    [--rebuild] [--no-cache] [--buildkit] [--no-base] [--ports …] [--fro
           [--update-remote-user-uid-default never|on|off]
 dev down  [--remove]
 dev shell [--shell /bin/bash]
-dev exec  [-u <user>] -- <cmd>…
+dev exec  [-u <user>] [-i] -- <cmd>…
 
 dev status [--json]
 dev open   [--insiders]

@@ -9,9 +9,10 @@ pub async fn run(
     runtime_override: Option<&str>,
     user: Option<&str>,
     cmd: &[String],
+    interactive: bool,
 ) -> anyhow::Result<()> {
     let runtime = detect_runtime(runtime_override).await?;
-    run_with_runtime(workspace, runtime.as_ref(), user, cmd).await
+    run_with_runtime(workspace, runtime.as_ref(), user, cmd, interactive).await
 }
 
 pub(crate) async fn run_with_runtime(
@@ -19,6 +20,7 @@ pub(crate) async fn run_with_runtime(
     runtime: &dyn crate::runtime::ContainerRuntime,
     user: Option<&str>,
     cmd: &[String],
+    interactive: bool,
 ) -> anyhow::Result<()> {
     let labels = workspace_labels(workspace, None);
     let filters: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
@@ -49,6 +51,18 @@ pub(crate) async fn run_with_runtime(
         Some(config) => config.workspace_folder_path(workspace, effective_user)?,
         None => format!("/workspaces/{}", workspace_folder_name(workspace)),
     };
+
+    // Interactive callers own the terminal, so the runtime attaches stdin and
+    // a TTY and streams output; there is nothing to capture or re-print.
+    if interactive {
+        let exit_code = runtime
+            .exec_interactive(&container.id, cmd, effective_user, Some(&workdir))
+            .await?;
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return Ok(());
+    }
 
     let result = runtime
         .exec(&container.id, cmd, effective_user, Some(&workdir))
@@ -91,6 +105,7 @@ mod tests {
     struct ExecFakeRuntime {
         containers: Vec<ContainerInfo>,
         execs: Arc<Mutex<Vec<ExecCall>>>,
+        interactive_execs: Arc<Mutex<Vec<ExecCall>>>,
     }
 
     impl ExecFakeRuntime {
@@ -106,11 +121,16 @@ mod tests {
                     image: "ubuntu:24.04".to_string(),
                 }],
                 execs: Arc::new(Mutex::new(Vec::new())),
+                interactive_execs: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         fn execs(&self) -> Vec<ExecCall> {
             self.execs.lock().unwrap().clone()
+        }
+
+        fn interactive_execs(&self) -> Vec<ExecCall> {
+            self.interactive_execs.lock().unwrap().clone()
         }
     }
 
@@ -175,11 +195,16 @@ mod tests {
         fn exec_interactive(
             &self,
             _id: &str,
-            _cmd: &[String],
-            _user: Option<&str>,
-            _workdir: Option<&str>,
+            cmd: &[String],
+            user: Option<&str>,
+            workdir: Option<&str>,
         ) -> BoxFut<'_, i32> {
-            unused()
+            self.interactive_execs.lock().unwrap().push((
+                cmd.to_vec(),
+                user.map(str::to_string),
+                workdir.map(str::to_string),
+            ));
+            Box::pin(async { Ok(0) })
         }
 
         fn inspect_container(&self, _id: &str) -> BoxFut<'_, ContainerInfo> {
@@ -247,6 +272,7 @@ mod tests {
             &runtime,
             None,
             &["cargo".to_string(), "test".to_string()],
+            false,
         )
         .await
         .expect("dev exec should run the command");
@@ -255,5 +281,53 @@ mod tests {
         assert_eq!(execs.len(), 1);
         assert_eq!(execs[0].0, vec!["cargo".to_string(), "test".to_string()]);
         assert_eq!(execs[0].2.as_deref(), Some("/srv/app/packages/api"));
+        assert!(runtime.interactive_execs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn interactive_exec_attaches_instead_of_capturing() {
+        let workspace = TempDir::new().unwrap();
+        let devcontainer_dir = workspace.path().join(".devcontainer");
+        std::fs::create_dir_all(&devcontainer_dir).unwrap();
+        let config_path = devcontainer_dir.join("devcontainer.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+                "image": "ubuntu:24.04",
+                "workspaceMount": "source=${localWorkspaceFolder},target=/srv/app,type=bind",
+                "workspaceFolder": "/srv/app/packages/api"
+            }"#,
+        )
+        .unwrap();
+        let runtime = ExecFakeRuntime::running_for(workspace.path(), &config_path);
+
+        run_with_runtime(
+            workspace.path(),
+            &runtime,
+            None,
+            &[
+                "env".to_string(),
+                "TMUX_PANE=%1".to_string(),
+                "pi".to_string(),
+            ],
+            true,
+        )
+        .await
+        .expect("interactive dev exec should attach");
+
+        // The attached path must not fall back to the captured path, or the
+        // caller's terminal never sees the command's output.
+        assert!(runtime.execs().is_empty());
+        let interactive = runtime.interactive_execs();
+        assert_eq!(interactive.len(), 1);
+        assert_eq!(
+            interactive[0].0,
+            vec![
+                "env".to_string(),
+                "TMUX_PANE=%1".to_string(),
+                "pi".to_string()
+            ]
+        );
+        assert_eq!(interactive[0].2.as_deref(), Some("/srv/app/packages/api"));
     }
 }
