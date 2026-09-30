@@ -107,8 +107,19 @@ async fn run() -> anyhow::Result<()> {
         Command::Down { remove } => {
             commands::down::run(&workspace, runtime_override, remove).await?;
         }
-        Command::Exec { user, cmd } => {
-            commands::exec::run(&workspace, runtime_override, user.as_deref(), &cmd).await?;
+        Command::Exec {
+            user,
+            interactive,
+            cmd,
+        } => {
+            commands::exec::run(
+                &workspace,
+                runtime_override,
+                user.as_deref(),
+                &cmd,
+                interactive,
+            )
+            .await?;
         }
         Command::Forward {
             port,
